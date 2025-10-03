@@ -1,0 +1,2 @@
+// BotをDiscordに接続します
+client.login(process.env.DISCORD_TOKEN);
