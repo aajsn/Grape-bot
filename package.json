@@ -1,2 +1,14 @@
-// BotをDiscordに接続します
-client.login(process.env.DISCORD_TOKEN);
+{
+  "name": "discord-spam-bot",
+  "version": "1.0.0",
+  "description": "Fortify style spam protection for Discord.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.15.3",
+    "@discordjs/builders": "^1.8.3",
+    "discord-api-types": "^0.37.78"
+  }
+}
