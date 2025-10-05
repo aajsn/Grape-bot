@@ -1,4 +1,4 @@
-ɹǝuʍoqnS Ԁſ ꓷSꓥW
+{"name": "discord-spam-bot","version": "1.0.0","description": "Fortify style spam protection for Discord.","main": "index.js","scripts": {"start": "node --experimental-json-modules src/index.js"},"dependencies": {"discord.js": "^14.15.3","discord-api-types": "^0.37.78","firebase": "^10.11.0"}}
 "start": "node --experimental-json-modules index.js"
 },
 "dependencies": {
