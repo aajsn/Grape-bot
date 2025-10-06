@@ -1,7 +1,7 @@
-// Discord.jsとFirebaseをCommonJS形式で読み込みます
+// Discord.jsをCommonJS形式で読み込みます
 const { Client, GatewayIntentBits, SlashCommandBuilder } = require('discord.js');
-const { initializeApp, cert } = require('firebase/app');
-const { getFirestore, doc, setDoc, getDoc } = require('firebase/firestore');
+// Firebase Admin SDKのコアモジュール全体をインポートします
+const admin = require('firebase-admin');
 
 // 環境変数を取得します
 const token = process.env.DISCORD_TOKEN;
@@ -21,10 +21,17 @@ try {
 
 // Firebaseの初期化とFirestoreへの接続
 // Renderの環境変数から読み込んだ鍵を使って初期化します
-const app = initializeApp({
-    credential: cert(serviceAccount)
+// Admin SDKのcredentialとfirestoreを取得します
+const app = admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount)
 });
-const db = getFirestore(app);
+// Firestoreクライアントを取得します
+const db = admin.firestore(app);
+
+// Firestoreのユーティリティ関数を簡略化します
+const doc = db.doc.bind(db);
+const setDoc = (ref, data, options) => ref.set(data, options);
+const getDoc = (ref) => ref.get();
 
 // データベースのコレクション名
 const SETTINGS_COLLECTION = 'spam_settings';
@@ -91,10 +98,10 @@ client.once('ready', async () => {
  */
 async function getSpamSettings(guildId) {
     try {
-        const docRef = doc(db, SETTINGS_COLLECTION, guildId);
+        const docRef = doc(SETTINGS_COLLECTION, guildId);
         const docSnap = await getDoc(docRef);
 
-        if (docSnap.exists()) {
+        if (docSnap.exists) {
             return docSnap.data();
         } else {
             // ドキュメントが存在しない場合はデフォルト設定を保存してから返します
@@ -114,7 +121,7 @@ async function getSpamSettings(guildId) {
  */
 async function saveSpamSettings(guildId, settings) {
     try {
-        const docRef = doc(db, SETTINGS_COLLECTION, guildId);
+        const docRef = doc(SETTINGS_COLLECTION, guildId);
         await setDoc(docRef, settings, { merge: true });
     } catch (error) {
         console.error("Firestoreへの設定の保存に失敗しました。", error);
