@@ -29,7 +29,7 @@ const app = admin.initializeApp({
 const db = admin.firestore(app);
 
 // Firestoreのユーティリティ関数を簡略化します
-// ⭐ 修正: doc() 関数の代わりに collection() を使用し、get() や set() は直接参照に対して呼び出します
+// Admin SDKではdoc()を使わず、collection().doc()を使います
 const collection = db.collection.bind(db); // コレクション参照を取得するための関数
 
 // データベースのコレクション名
@@ -37,7 +37,7 @@ const SETTINGS_COLLECTION = 'spam_settings';
 const DEFAULT_SETTINGS = {
     timeframe: 2000, // 2000ミリ秒 (2秒)
     limit: 5,        // 5回
-    action: 'mute'   // デフォルトのアクション
+    action: 'timeout'   // デフォルトのアクション (muteからtimeoutに変更)
 };
 
 // Discordクライアントの初期化
@@ -109,7 +109,8 @@ async function getSpamSettings(guildId) {
             return DEFAULT_SETTINGS;
         }
     } catch (error) {
-        console.error("Firestoreから設定の読み込み/保存に失敗しました。デフォルト設定を使用します。", error);
+        // エラーログを改善し、クラッシュを防止
+        console.error("ERROR: Firestoreから設定の読み込み/保存に失敗しました。デフォルト設定を使用します。", error.message);
         return DEFAULT_SETTINGS; // DBエラー時もBotはクラッシュせず続行
     }
 }
@@ -125,7 +126,7 @@ async function saveSpamSettings(guildId, settings) {
         const docRef = collection(SETTINGS_COLLECTION).doc(guildId);
         await docRef.set(settings, { merge: true }); // docRefに対してset()を呼び出し
     } catch (error) {
-        console.error("Firestoreへの設定の保存に失敗しました。", error);
+        console.error("ERROR: Firestoreへの設定の保存に失敗しました。", error.message);
     }
 }
 
@@ -159,24 +160,25 @@ client.on('messageCreate', async message => {
         // 規制アクションを実行
         console.log(`連投を検出: ユーザー ${message.author.tag} が ${timeframe}ms に ${history.length} 回送信しました。`);
 
+        // メッセージを削除する際は、Botのメッセージもすぐに消えるようにします
         if (action === 'delete') {
             // メッセージ削除アクション
             const messagesToDelete = await message.channel.messages.fetch({ limit: history.length });
             messagesToDelete.forEach(msg => {
                 if (msg.author.id === userId) {
-                    msg.delete().catch(err => console.error("メッセージ削除エラー:", err));
+                    msg.delete().catch(err => console.error("メッセージ削除エラー (権限不足等):", err));
                 }
             });
             message.channel.send(`🚨 **連投検知:** ${message.author} のメッセージが ${timeframe}ms 以内に ${limit} 回を超えたため削除しました。`).then(m => setTimeout(() => m.delete(), 5000));
         } else if (action === 'timeout') {
-            // タイムアウトアクション (discord.js v13以降で利用可能)
+            // タイムアウトアクション
             // タイムアウトを1分間に設定
             const timeoutDuration = 60000; 
             message.member.timeout(timeoutDuration, '連投規制違反')
                 .then(() => {
                     message.channel.send(`🚨 **連投検知:** ${message.author} を連投規制違反のため ${timeoutDuration / 1000}秒間タイムアウトしました。`).then(m => setTimeout(() => m.delete(), 5000));
                 })
-                .catch(err => console.error("タイムアウト処理エラー:", err));
+                .catch(err => console.error("タイムアウト処理エラー (権限不足等):", err));
         }
 
         // 規制が発動したら、履歴をリセットしてペナルティ後のメッセージを許可する
@@ -186,6 +188,7 @@ client.on('messageCreate', async message => {
 
 client.on('interactionCreate', async interaction => {
     if (!interaction.isCommand()) return;
+    // 権限チェック
     if (!interaction.memberPermissions.has('Administrator')) {
         return interaction.reply({ content: 'このコマンドを実行するには管理者権限が必要です。', ephemeral: true });
     }
