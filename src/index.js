@@ -51,37 +51,39 @@ const client = new Client({
 client.once('ready', async () => {
     console.log('Botが起動しました:', client.user.tag);
 
-    // ✅ 新しいスラッシュコマンド：/spam-config (サブコマンドと必須オプションを使用)
+    // ✅ /spam-config コマンド
     const spamConfigCommand = new SlashCommandBuilder()
         .setName('spam-config')
         .setDescription('連投規制の設定を管理します。')
         // 管理者権限を持つユーザーのみデフォルトで許可
         .setDefaultMemberPermissions(0) 
         
-        // 1. サブコマンド: 'set' (設定変更 - rate, limit, actionをまとめて扱う)
+        // 1. サブコマンド: 'set' (設定変更)
         .addSubcommand(subcommand =>
             subcommand.setName('set')
                  .setDescription('連投規制のルール（時間、回数、動作）を変更します。')
                  
-                // オプション1: rate (時間と動作のセット)
+                // オプション1: rate (時間)
                 .addIntegerOption(option =>
                     option.setName('rate')
                         .setDescription('規制時間 (ミリ秒) - 例: 1500 (1.5秒)')
-                        .setRequired(false)) // rateまたはlimitのどちらかがあればOK
+                        .setRequired(false)) 
+                
+                // オプション2: action (動作) - rateと同時に指定されることを想定
                 .addStringOption(option =>
                     option.setName('action')
-                        .setDescription('規制を超えた場合の動作 (rateが指定された場合のみ有効)')
+                        .setDescription('規制を超えた場合の動作 (rateと同時に指定)')
                         .setRequired(false) 
                         .addChoices(
                             { name: 'メッセージを削除 (delete)', value: 'delete' },
                             { name: 'ユーザーをタイムアウト (timeout)', value: 'timeout' }
                         ))
                 
-                // オプション2: limit (回数)
+                // オプション3: limit (回数)
                 .addIntegerOption(option =>
                     option.setName('limit')
                         .setDescription('メッセージの最大送信回数 - 例: 5')
-                        .setRequired(false)) // rateまたはlimitのどちらかがあればOK
+                        .setRequired(false))
         )
 
         // 2. サブコマンド: 'show' (設定表示)
@@ -110,10 +112,12 @@ async function getSpamSettings(guildId) {
         if (docSnap.exists) {
             return docSnap.data();
         } else {
+            // ドキュメントが存在しない場合はデフォルト設定を保存してから返します
             await docRef.set(DEFAULT_SETTINGS); 
             return DEFAULT_SETTINGS;
         }
     } catch (error) {
+        // ⭐ エラー時のメッセージを改善し、クラッシュを防止
         console.error("ERROR: Firestoreから設定の読み込み/保存に失敗しました。デフォルト設定を使用します。", error.message);
         return DEFAULT_SETTINGS; 
     }
@@ -209,7 +213,10 @@ client.on('interactionCreate', async interaction => {
             const action = interaction.options.getString('action');
             const limit = interaction.options.getInteger('limit');
             
-            // ✅ 必須チェック: rateまたはlimitのどちらかが必須
+            let replyContent = '設定が更新されました:';
+            let changed = false; // 何か変更があったかどうかのフラグ
+
+            // ✅ 必須チェックとバリデーション (rate または limit のどちらか必須)
             if (rate === null && limit === null) {
                 return interaction.reply({ 
                     content: '設定を変更するには、**`rate` (規制時間) または `limit` (回数) の少なくとも一方**を指定する必要があります。', 
@@ -217,8 +224,6 @@ client.on('interactionCreate', async interaction => {
                 });
             }
             
-            let replyContent = '設定が更新されました:';
-
             // 1. rate (規制時間) と action の処理
             if (rate !== null) {
                 if (rate < 100) {
@@ -227,8 +232,9 @@ client.on('interactionCreate', async interaction => {
                 
                 settings.timeframe = rate;
                 replyContent += `\n- **規制時間:** ${rate}ミリ秒 (${(rate / 1000).toFixed(2)}秒)`;
+                changed = true;
 
-                // rateが指定された場合、actionが指定されていれば更新
+                // actionが指定されていれば更新
                 if (action !== null) {
                     settings.action = action;
                     replyContent += `\n- **規制動作:** ${action}`;
@@ -236,8 +242,8 @@ client.on('interactionCreate', async interaction => {
                     replyContent += `\n- **規制動作:** (変更なし: ${settings.action})`;
                 }
             } else if (action !== null) {
-                 // rateが指定されていないのにactionだけ指定された場合の警告
-                 replyContent += `\n- **警告:** \`action\` は \`rate\` と同時に指定してください。今回は無視されます。`;
+                 // rateが指定されていないのにactionだけ指定された場合は警告
+                 replyContent += `\n- **警告:** \`action\` は \`rate\` と同時に指定してください。今回は \`rate\` が変更されないため、\`action\` の変更も適用されません。`;
             }
 
             // 2. limit (回数) の処理
@@ -247,10 +253,13 @@ client.on('interactionCreate', async interaction => {
                 }
                 settings.limit = limit;
                 replyContent += `\n- **連投回数:** ${limit}回`;
+                changed = true;
             }
             
-            // DBに保存
-            await saveSpamSettings(guildId, settings);
+            // 変更があった場合のみDBに保存を試みる
+            if (changed) {
+                await saveSpamSettings(guildId, settings);
+            }
 
             await interaction.reply({
                 content: replyContent,
