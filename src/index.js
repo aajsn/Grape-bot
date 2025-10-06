@@ -29,9 +29,8 @@ const app = admin.initializeApp({
 const db = admin.firestore(app);
 
 // Firestoreのユーティリティ関数を簡略化します
-const doc = db.doc.bind(db);
-const setDoc = (ref, data, options) => ref.set(data, options);
-const getDoc = (ref) => ref.get();
+// ⭐ 修正: doc() 関数の代わりに collection() を使用し、get() や set() は直接参照に対して呼び出します
+const collection = db.collection.bind(db); // コレクション参照を取得するための関数
 
 // データベースのコレクション名
 const SETTINGS_COLLECTION = 'spam_settings';
@@ -98,14 +97,15 @@ client.once('ready', async () => {
  */
 async function getSpamSettings(guildId) {
     try {
-        const docRef = doc(SETTINGS_COLLECTION, guildId);
-        const docSnap = await getDoc(docRef);
+        // ⭐ 修正: collection().doc() 形式で明確にドキュメントを参照します
+        const docRef = collection(SETTINGS_COLLECTION).doc(guildId);
+        const docSnap = await docRef.get(); // docRefに対してget()を呼び出し
 
         if (docSnap.exists) {
             return docSnap.data();
         } else {
             // ドキュメントが存在しない場合はデフォルト設定を保存してから返します
-            await setDoc(docRef, DEFAULT_SETTINGS);
+            await docRef.set(DEFAULT_SETTINGS); // docRefに対してset()を呼び出し
             return DEFAULT_SETTINGS;
         }
     } catch (error) {
@@ -121,8 +121,9 @@ async function getSpamSettings(guildId) {
  */
 async function saveSpamSettings(guildId, settings) {
     try {
-        const docRef = doc(SETTINGS_COLLECTION, guildId);
-        await setDoc(docRef, settings, { merge: true });
+        // ⭐ 修正: collection().doc() 形式で明確にドキュメントを参照します
+        const docRef = collection(SETTINGS_COLLECTION).doc(guildId);
+        await docRef.set(settings, { merge: true }); // docRefに対してset()を呼び出し
     } catch (error) {
         console.error("Firestoreへの設定の保存に失敗しました。", error);
     }
