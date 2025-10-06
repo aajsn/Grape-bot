@@ -146,12 +146,22 @@ client.on('messageCreate', async message => {
     // Bot自身のメッセージやDMは無視
     if (message.author.bot || !message.guild) return;
 
+    // メンバーオブジェクトがない場合は取得を試みる (タイムアウト処理のため)
+    if (!message.member) {
+        try {
+            // 💡 メンバーインテントが有効でないと、このフェッチは失敗します
+            message.member = await message.guild.members.fetch(message.author.id);
+        } catch (e) {
+            console.error("Failed to fetch guild member (Check SERVER MEMBERS INTENT):", e);
+            return;
+        }
+    }
+
     const guildId = message.guild.id;
     const userId = message.author.id;
     const currentTimestamp = Date.now();
 
     // メッセージ受信時にFirestoreアクセスを極力回避
-    // (ここでは設定を読み込む必要があるので、やむを得ずアクセス)
     const settings = await getSpamSettings(guildId);
     const { timeframe, limit, action } = settings;
 
@@ -182,11 +192,15 @@ client.on('messageCreate', async message => {
         } else if (action === 'timeout') {
             // タイムアウトアクション
             const timeoutDuration = 60000; 
-            message.member.timeout(timeoutDuration, '連投規制違反')
-                .then(() => {
-                    message.channel.send(`🚨 **連投検知:** ${message.author} を連投規制違反のため ${timeoutDuration / 1000}秒間タイムアウトしました。`).then(m => setTimeout(() => m.delete(), 5000));
-                })
-                .catch(err => console.error("タイムアウト処理エラー (権限不足等):", err));
+            if (message.member) {
+                message.member.timeout(timeoutDuration, '連投規制違反')
+                    .then(() => {
+                        message.channel.send(`🚨 **連投検知:** ${message.author} を連投規制違反のため ${timeoutDuration / 1000}秒間タイムアウトしました。`).then(m => setTimeout(() => m.delete(), 5000));
+                    })
+                    .catch(err => console.error("タイムアウト処理エラー (権限不足等):", err));
+            } else {
+                 console.error("Member object missing, cannot execute timeout action.");
+            }
         }
 
         // 規制が発動したら、履歴をリセットしてペナルティ後のメッセージを許可する
