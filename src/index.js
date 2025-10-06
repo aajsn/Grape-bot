@@ -51,45 +51,37 @@ const client = new Client({
 client.once('ready', async () => {
     console.log('Botが起動しました:', client.user.tag);
 
-    // ✅ 新しいスラッシュコマンド：/spam-config (サブコマンドグループを使用)
+    // ✅ 新しいスラッシュコマンド：/spam-config (サブコマンドと必須オプションを使用)
     const spamConfigCommand = new SlashCommandBuilder()
         .setName('spam-config')
         .setDescription('連投規制の設定を管理します。')
         // 管理者権限を持つユーザーのみデフォルトで許可
         .setDefaultMemberPermissions(0) 
         
-        // 1. サブコマンドグループ: 'set' (設定変更)
-        .addSubcommandGroup(group =>
-            group.setName('set')
+        // 1. サブコマンド: 'set' (設定変更 - rate, limit, actionをまとめて扱う)
+        .addSubcommand(subcommand =>
+            subcommand.setName('set')
                  .setDescription('連投規制のルール（時間、回数、動作）を変更します。')
                  
-                // サブコマンド: 'rate-limit' (時間と動作)
-                .addSubcommand(subcommand =>
-                    subcommand.setName('rate-limit')
-                        .setDescription('規制時間(ms)とアクションを設定します。')
-                        .addIntegerOption(option =>
-                            option.setName('milliseconds')
-                                .setDescription('規制時間 (ミリ秒) 例: 1500 (1.5秒)')
-                                .setRequired(true))
-                        .addStringOption(option =>
-                            option.setName('action')
-                                .setDescription('規制を超えた場合の動作')
-                                .setRequired(true)
-                                .addChoices(
-                                    { name: 'メッセージを削除 (delete)', value: 'delete' },
-                                    { name: 'ユーザーをタイムアウト (timeout)', value: 'timeout' }
-                                ))
-                )
+                // オプション1: rate (時間と動作のセット)
+                .addIntegerOption(option =>
+                    option.setName('rate')
+                        .setDescription('規制時間 (ミリ秒) - 例: 1500 (1.5秒)')
+                        .setRequired(false)) // rateまたはlimitのどちらかがあればOK
+                .addStringOption(option =>
+                    option.setName('action')
+                        .setDescription('規制を超えた場合の動作 (rateが指定された場合のみ有効)')
+                        .setRequired(false) 
+                        .addChoices(
+                            { name: 'メッセージを削除 (delete)', value: 'delete' },
+                            { name: 'ユーザーをタイムアウト (timeout)', value: 'timeout' }
+                        ))
                 
-                // サブコマンド: 'limit-count' (回数)
-                .addSubcommand(subcommand =>
-                    subcommand.setName('limit-count')
-                        .setDescription('連投と見なすメッセージの回数を設定します。')
-                        .addIntegerOption(option =>
-                            option.setName('count')
-                                .setDescription('メッセージの最大送信回数 例: 5')
-                                .setRequired(true))
-                )
+                // オプション2: limit (回数)
+                .addIntegerOption(option =>
+                    option.setName('limit')
+                        .setDescription('メッセージの最大送信回数 - 例: 5')
+                        .setRequired(false)) // rateまたはlimitのどちらかがあればOK
         )
 
         // 2. サブコマンド: 'show' (設定表示)
@@ -100,7 +92,7 @@ client.once('ready', async () => {
 
 
     await client.application.commands.set([
-        spamConfigCommand // 新しい /spam-config のみを登録
+        spamConfigCommand
     ]);
     console.log('スラッシュコマンドの登録が完了しました。');
 });
@@ -208,45 +200,62 @@ client.on('interactionCreate', async interaction => {
     
     // /spam-config コマンドの処理
     if (commandName === 'spam-config') {
-        const subcommandGroup = interaction.options.getSubcommandGroup();
         const subcommand = interaction.options.getSubcommand();
         let settings = await getSpamSettings(guildId);
 
-        // --- 'set' グループの処理 ---
-        if (subcommandGroup === 'set') {
+        // --- 'set' サブコマンドの処理 ---
+        if (subcommand === 'set') {
+            const rate = interaction.options.getInteger('rate');
+            const action = interaction.options.getString('action');
+            const limit = interaction.options.getInteger('limit');
             
-            if (subcommand === 'rate-limit') {
-                const milliseconds = interaction.options.getInteger('milliseconds');
-                const limitAction = interaction.options.getString('action');
-
-                if (milliseconds < 100) {
-                    return interaction.reply({ content: '規制時間 (ミリ秒) は最低100ms以上に設定してください。', ephemeral: true });
-                }
-
-                settings.timeframe = milliseconds;
-                settings.action = limitAction;
-                await saveSpamSettings(guildId, settings);
-
-                await interaction.reply({
-                    content: `連投規制時間を **${milliseconds}ミリ秒 (${(milliseconds / 1000).toFixed(2)}秒)** に、規制動作を **${limitAction}** に設定しました。`,
-                    ephemeral: true
-                });
-                
-            } else if (subcommand === 'limit-count') {
-                const count = interaction.options.getInteger('count');
-
-                if (count < 2) {
-                    return interaction.reply({ content: '連投回数は最低2回以上に設定してください。', ephemeral: true });
-                }
-
-                settings.limit = count;
-                await saveSpamSettings(guildId, settings);
-
-                await interaction.reply({
-                    content: `連投と見なすメッセージ回数を **${count}回** に設定しました。`,
-                    ephemeral: true
+            // ✅ 必須チェック: rateまたはlimitのどちらかが必須
+            if (rate === null && limit === null) {
+                return interaction.reply({ 
+                    content: '設定を変更するには、**`rate` (規制時間) または `limit` (回数) の少なくとも一方**を指定する必要があります。', 
+                    ephemeral: true 
                 });
             }
+            
+            let replyContent = '設定が更新されました:';
+
+            // 1. rate (規制時間) と action の処理
+            if (rate !== null) {
+                if (rate < 100) {
+                    return interaction.reply({ content: '規制時間 (ミリ秒) は最低100ms以上に設定してください。', ephemeral: true });
+                }
+                
+                settings.timeframe = rate;
+                replyContent += `\n- **規制時間:** ${rate}ミリ秒 (${(rate / 1000).toFixed(2)}秒)`;
+
+                // rateが指定された場合、actionが指定されていれば更新
+                if (action !== null) {
+                    settings.action = action;
+                    replyContent += `\n- **規制動作:** ${action}`;
+                } else {
+                    replyContent += `\n- **規制動作:** (変更なし: ${settings.action})`;
+                }
+            } else if (action !== null) {
+                 // rateが指定されていないのにactionだけ指定された場合の警告
+                 replyContent += `\n- **警告:** \`action\` は \`rate\` と同時に指定してください。今回は無視されます。`;
+            }
+
+            // 2. limit (回数) の処理
+            if (limit !== null) {
+                if (limit < 2) {
+                    return interaction.reply({ content: '連投回数は最低2回以上に設定してください。', ephemeral: true });
+                }
+                settings.limit = limit;
+                replyContent += `\n- **連投回数:** ${limit}回`;
+            }
+            
+            // DBに保存
+            await saveSpamSettings(guildId, settings);
+
+            await interaction.reply({
+                content: replyContent,
+                ephemeral: true
+            });
 
         // --- 'show' サブコマンドの処理 ---
         } else if (subcommand === 'show') {
