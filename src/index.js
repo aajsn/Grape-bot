@@ -21,7 +21,6 @@ try {
 
 // Firebaseの初期化とFirestoreへの接続
 // Renderの環境変数から読み込んだ鍵を使って初期化します
-// Admin SDKのcredentialとfirestoreを取得します
 const app = admin.initializeApp({
     credential: admin.credential.cert(serviceAccount)
 });
@@ -29,15 +28,14 @@ const app = admin.initializeApp({
 const db = admin.firestore(app);
 
 // Firestoreのユーティリティ関数を簡略化します
-// Admin SDKではdoc()を使わず、collection().doc()を使います
-const collection = db.collection.bind(db); // コレクション参照を取得するための関数
+const collection = db.collection.bind(db); 
 
 // データベースのコレクション名
 const SETTINGS_COLLECTION = 'spam_settings';
 const DEFAULT_SETTINGS = {
     timeframe: 2000, // 2000ミリ秒 (2秒)
     limit: 5,        // 5回
-    action: 'timeout'   // デフォルトのアクション (muteからtimeoutに変更)
+    action: 'timeout'   // デフォルトのアクション 
 };
 
 // Discordクライアントの初期化
@@ -53,41 +51,58 @@ const client = new Client({
 client.once('ready', async () => {
     console.log('Botが起動しました:', client.user.tag);
 
-    // スラッシュコマンドの登録
-    const setRateLimitCommand = new SlashCommandBuilder()
-        .setName('set-rate-limit')
-        .setDescription('連投規制の時間をミリ秒単位で設定します (例: 100ms, 1000ms)')
-        .addIntegerOption(option =>
-            option.setName('milliseconds')
-                .setDescription('規制時間 (ミリ秒) 例: 100 (0.1秒)')
-                .setRequired(true))
-        .addStringOption(option =>
-            option.setName('limit_action')
-                .setDescription('規制を超えた場合の動作')
-                .setRequired(true)
-                .addChoices(
-                    { name: 'メッセージを削除 (delete)', value: 'delete' },
-                    { name: 'ユーザーをタイムアウト (timeout)', value: 'timeout' }
-                ));
+    // ✅ 新しいスラッシュコマンド：/spam-config (サブコマンドグループを使用)
+    const spamConfigCommand = new SlashCommandBuilder()
+        .setName('spam-config')
+        .setDescription('連投規制の設定を管理します。')
+        // 管理者権限を持つユーザーのみデフォルトで許可
+        .setDefaultMemberPermissions(0) 
+        
+        // 1. サブコマンドグループ: 'set' (設定変更)
+        .addSubcommandGroup(group =>
+            group.setName('set')
+                 .setDescription('連投規制のルール（時間、回数、動作）を変更します。')
+                 
+                // サブコマンド: 'rate-limit' (時間と動作)
+                .addSubcommand(subcommand =>
+                    subcommand.setName('rate-limit')
+                        .setDescription('規制時間(ms)とアクションを設定します。')
+                        .addIntegerOption(option =>
+                            option.setName('milliseconds')
+                                .setDescription('規制時間 (ミリ秒) 例: 1500 (1.5秒)')
+                                .setRequired(true))
+                        .addStringOption(option =>
+                            option.setName('action')
+                                .setDescription('規制を超えた場合の動作')
+                                .setRequired(true)
+                                .addChoices(
+                                    { name: 'メッセージを削除 (delete)', value: 'delete' },
+                                    { name: 'ユーザーをタイムアウト (timeout)', value: 'timeout' }
+                                ))
+                )
+                
+                // サブコマンド: 'limit-count' (回数)
+                .addSubcommand(subcommand =>
+                    subcommand.setName('limit-count')
+                        .setDescription('連投と見なすメッセージの回数を設定します。')
+                        .addIntegerOption(option =>
+                            option.setName('count')
+                                .setDescription('メッセージの最大送信回数 例: 5')
+                                .setRequired(true))
+                )
+        )
 
-    const setLimitCountCommand = new SlashCommandBuilder()
-        .setName('set-limit-count')
-        .setDescription('連投と見なすメッセージの回数を設定します')
-        .addIntegerOption(option =>
-            option.setName('count')
-                .setDescription('メッセージの最大送信回数 例: 5')
-                .setRequired(true));
+        // 2. サブコマンド: 'show' (設定表示)
+        .addSubcommand(subcommand =>
+            subcommand.setName('show')
+                .setDescription('現在の連投規制設定を表示します。')
+        );
 
-    const showSettingsCommand = new SlashCommandBuilder()
-        .setName('show-spam-settings')
-        .setDescription('現在の連投規制設定を表示します');
 
     await client.application.commands.set([
-        setRateLimitCommand,
-        setLimitCountCommand,
-        showSettingsCommand
+        spamConfigCommand // 新しい /spam-config のみを登録
     ]);
-    console.log('スラッシュコマンドを登録しました。');
+    console.log('スラッシュコマンドの登録が完了しました。');
 });
 
 /**
@@ -97,21 +112,18 @@ client.once('ready', async () => {
  */
 async function getSpamSettings(guildId) {
     try {
-        // ⭐ 修正: collection().doc() 形式で明確にドキュメントを参照します
         const docRef = collection(SETTINGS_COLLECTION).doc(guildId);
-        const docSnap = await docRef.get(); // docRefに対してget()を呼び出し
+        const docSnap = await docRef.get(); 
 
         if (docSnap.exists) {
             return docSnap.data();
         } else {
-            // ドキュメントが存在しない場合はデフォルト設定を保存してから返します
-            await docRef.set(DEFAULT_SETTINGS); // docRefに対してset()を呼び出し
+            await docRef.set(DEFAULT_SETTINGS); 
             return DEFAULT_SETTINGS;
         }
     } catch (error) {
-        // エラーログを改善し、クラッシュを防止
         console.error("ERROR: Firestoreから設定の読み込み/保存に失敗しました。デフォルト設定を使用します。", error.message);
-        return DEFAULT_SETTINGS; // DBエラー時もBotはクラッシュせず続行
+        return DEFAULT_SETTINGS; 
     }
 }
 
@@ -122,9 +134,8 @@ async function getSpamSettings(guildId) {
  */
 async function saveSpamSettings(guildId, settings) {
     try {
-        // ⭐ 修正: collection().doc() 形式で明確にドキュメントを参照します
         const docRef = collection(SETTINGS_COLLECTION).doc(guildId);
-        await docRef.set(settings, { merge: true }); // docRefに対してset()を呼び出し
+        await docRef.set(settings, { merge: true }); 
     } catch (error) {
         console.error("ERROR: Firestoreへの設定の保存に失敗しました。", error.message);
     }
@@ -160,7 +171,6 @@ client.on('messageCreate', async message => {
         // 規制アクションを実行
         console.log(`連投を検出: ユーザー ${message.author.tag} が ${timeframe}ms に ${history.length} 回送信しました。`);
 
-        // メッセージを削除する際は、Botのメッセージもすぐに消えるようにします
         if (action === 'delete') {
             // メッセージ削除アクション
             const messagesToDelete = await message.channel.messages.fetch({ limit: history.length });
@@ -172,7 +182,6 @@ client.on('messageCreate', async message => {
             message.channel.send(`🚨 **連投検知:** ${message.author} のメッセージが ${timeframe}ms 以内に ${limit} 回を超えたため削除しました。`).then(m => setTimeout(() => m.delete(), 5000));
         } else if (action === 'timeout') {
             // タイムアウトアクション
-            // タイムアウトを1分間に設定
             const timeoutDuration = 60000; 
             message.member.timeout(timeoutDuration, '連投規制違反')
                 .then(() => {
@@ -188,56 +197,68 @@ client.on('messageCreate', async message => {
 
 client.on('interactionCreate', async interaction => {
     if (!interaction.isCommand()) return;
-    // 権限チェック
+    
+    const { commandName } = interaction;
+    const guildId = interaction.guild.id;
+    
+    // 常に権限チェックを行う
     if (!interaction.memberPermissions.has('Administrator')) {
         return interaction.reply({ content: 'このコマンドを実行するには管理者権限が必要です。', ephemeral: true });
     }
+    
+    // /spam-config コマンドの処理
+    if (commandName === 'spam-config') {
+        const subcommandGroup = interaction.options.getSubcommandGroup();
+        const subcommand = interaction.options.getSubcommand();
+        let settings = await getSpamSettings(guildId);
 
-    const { commandName } = interaction;
-    const guildId = interaction.guild.id;
-    let settings = await getSpamSettings(guildId);
+        // --- 'set' グループの処理 ---
+        if (subcommandGroup === 'set') {
+            
+            if (subcommand === 'rate-limit') {
+                const milliseconds = interaction.options.getInteger('milliseconds');
+                const limitAction = interaction.options.getString('action');
 
-    if (commandName === 'set-rate-limit') {
-        const milliseconds = interaction.options.getInteger('milliseconds');
-        const limitAction = interaction.options.getString('limit_action');
+                if (milliseconds < 100) {
+                    return interaction.reply({ content: '規制時間 (ミリ秒) は最低100ms以上に設定してください。', ephemeral: true });
+                }
 
-        if (milliseconds < 100) {
-            return interaction.reply({ content: '規制時間 (ミリ秒) は最低100ms以上に設定してください。', ephemeral: true });
+                settings.timeframe = milliseconds;
+                settings.action = limitAction;
+                await saveSpamSettings(guildId, settings);
+
+                await interaction.reply({
+                    content: `連投規制時間を **${milliseconds}ミリ秒 (${(milliseconds / 1000).toFixed(2)}秒)** に、規制動作を **${limitAction}** に設定しました。`,
+                    ephemeral: true
+                });
+                
+            } else if (subcommand === 'limit-count') {
+                const count = interaction.options.getInteger('count');
+
+                if (count < 2) {
+                    return interaction.reply({ content: '連投回数は最低2回以上に設定してください。', ephemeral: true });
+                }
+
+                settings.limit = count;
+                await saveSpamSettings(guildId, settings);
+
+                await interaction.reply({
+                    content: `連投と見なすメッセージ回数を **${count}回** に設定しました。`,
+                    ephemeral: true
+                });
+            }
+
+        // --- 'show' サブコマンドの処理 ---
+        } else if (subcommand === 'show') {
+            const displayTime = settings.timeframe < 1000
+                ? `${settings.timeframe}ミリ秒`
+                : `${(settings.timeframe / 1000).toFixed(1)}秒`;
+
+            await interaction.reply({
+                content: `## 🚨 現在の連投規制設定\n\n- **規制時間 (タイムフレーム):** ${displayTime}\n- **連投回数 (リミット):** ${settings.limit}回\n- **規制動作 (アクション):** ${settings.action}`,
+                ephemeral: true
+            });
         }
-
-        settings.timeframe = milliseconds;
-        settings.action = limitAction;
-        await saveSpamSettings(guildId, settings);
-
-        await interaction.reply({
-            content: `連投規制時間を **${milliseconds}ミリ秒 (${(milliseconds / 1000).toFixed(2)}秒)** に、規制動作を **${limitAction}** に設定しました。`,
-            ephemeral: true
-        });
-
-    } else if (commandName === 'set-limit-count') {
-        const count = interaction.options.getInteger('count');
-
-        if (count < 2) {
-            return interaction.reply({ content: '連投回数は最低2回以上に設定してください。', ephemeral: true });
-        }
-
-        settings.limit = count;
-        await saveSpamSettings(guildId, settings);
-
-        await interaction.reply({
-            content: `連投と見なすメッセージ回数を **${count}回** に設定しました。`,
-            ephemeral: true
-        });
-
-    } else if (commandName === 'show-spam-settings') {
-        const displayTime = settings.timeframe < 1000
-            ? `${settings.timeframe}ミリ秒`
-            : `${(settings.timeframe / 1000).toFixed(1)}秒`;
-
-        await interaction.reply({
-            content: `## 🚨 現在の連投規制設定\n\n- **規制時間 (タイムフレーム):** ${displayTime}\n- **連投回数 (リミット):** ${settings.limit}回\n- **規制動作 (アクション):** ${settings.action}`,
-            ephemeral: true
-        });
     }
 });
 
