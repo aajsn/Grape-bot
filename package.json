@@ -4,7 +4,7 @@
 "description": "Fortify style spam protection for Discord.",
 "main": "index.js",
 "scripts": {
-"start": "node --experimental-json-modules src/index.js"
+"start": "node src/index.js"
 },
 "dependencies": {
 "discord.js": "^14.15.3",
