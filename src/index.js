@@ -40,10 +40,12 @@ const DEFAULT_SETTINGS = {
 
 // Discordクライアントの初期化
 const client = new Client({
+    // Discord Botの必須インテントを設定
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildMembers // タイムアウト処理に必要
     ]
 });
 
@@ -117,7 +119,7 @@ async function getSpamSettings(guildId) {
             return DEFAULT_SETTINGS;
         }
     } catch (error) {
-        // ⭐ エラー時のメッセージを改善し、クラッシュを防止
+        // Firestoreエラー時はログを出力し、デフォルト設定を返してクラッシュを防止
         console.error("ERROR: Firestoreから設定の読み込み/保存に失敗しました。デフォルト設定を使用します。", error.message);
         return DEFAULT_SETTINGS; 
     }
@@ -148,7 +150,8 @@ client.on('messageCreate', async message => {
     const userId = message.author.id;
     const currentTimestamp = Date.now();
 
-    // サーバーの設定を読み込み
+    // メッセージ受信時にFirestoreアクセスを極力回避
+    // (ここでは設定を読み込む必要があるので、やむを得ずアクセス)
     const settings = await getSpamSettings(guildId);
     const { timeframe, limit, action } = settings;
 
@@ -205,6 +208,11 @@ client.on('interactionCreate', async interaction => {
     // /spam-config コマンドの処理
     if (commandName === 'spam-config') {
         const subcommand = interaction.options.getSubcommand();
+        
+        // 🚨 コマンド応答の高速化: 3秒の制限を回避するため、先にdeferReplyで応答する
+        await interaction.deferReply({ ephemeral: true });
+
+        // 設定の読み込みはdeferReply後に行う
         let settings = await getSpamSettings(guildId);
 
         // --- 'set' サブコマンドの処理 ---
@@ -214,20 +222,19 @@ client.on('interactionCreate', async interaction => {
             const limit = interaction.options.getInteger('limit');
             
             let replyContent = '設定が更新されました:';
-            let changed = false; // 何か変更があったかどうかのフラグ
+            let changed = false; 
 
             // ✅ 必須チェックとバリデーション (rate または limit のどちらか必須)
             if (rate === null && limit === null) {
-                return interaction.reply({ 
-                    content: '設定を変更するには、**`rate` (規制時間) または `limit` (回数) の少なくとも一方**を指定する必要があります。', 
-                    ephemeral: true 
+                return interaction.editReply({ 
+                    content: '設定を変更するには、**`rate` (規制時間) または `limit` (回数) の少なくとも一方**を指定する必要があります。'
                 });
             }
             
             // 1. rate (規制時間) と action の処理
             if (rate !== null) {
                 if (rate < 100) {
-                    return interaction.reply({ content: '規制時間 (ミリ秒) は最低100ms以上に設定してください。', ephemeral: true });
+                    return interaction.editReply({ content: '規制時間 (ミリ秒) は最低100ms以上に設定してください。' });
                 }
                 
                 settings.timeframe = rate;
@@ -243,13 +250,13 @@ client.on('interactionCreate', async interaction => {
                 }
             } else if (action !== null) {
                  // rateが指定されていないのにactionだけ指定された場合は警告
-                 replyContent += `\n- **警告:** \`action\` は \`rate\` と同時に指定してください。今回は \`rate\` が変更されないため、\`action\` の変更も適用されません。`;
+                 replyContent += `\n- **警告:** \`action\` は \`rate\` と同時に指定してください。今回は \`rate\` が変更されないため、\`action\` の変更は適用されません。`;
             }
 
             // 2. limit (回数) の処理
             if (limit !== null) {
                 if (limit < 2) {
-                    return interaction.reply({ content: '連投回数は最低2回以上に設定してください。', ephemeral: true });
+                    return interaction.editReply({ content: '連投回数は最低2回以上に設定してください。' });
                 }
                 settings.limit = limit;
                 replyContent += `\n- **連投回数:** ${limit}回`;
@@ -261,9 +268,9 @@ client.on('interactionCreate', async interaction => {
                 await saveSpamSettings(guildId, settings);
             }
 
-            await interaction.reply({
-                content: replyContent,
-                ephemeral: true
+            // 最終的な応答を送信
+            await interaction.editReply({
+                content: replyContent
             });
 
         // --- 'show' サブコマンドの処理 ---
@@ -272,9 +279,9 @@ client.on('interactionCreate', async interaction => {
                 ? `${settings.timeframe}ミリ秒`
                 : `${(settings.timeframe / 1000).toFixed(1)}秒`;
 
-            await interaction.reply({
-                content: `## 🚨 現在の連投規制設定\n\n- **規制時間 (タイムフレーム):** ${displayTime}\n- **連投回数 (リミット):** ${settings.limit}回\n- **規制動作 (アクション):** ${settings.action}`,
-                ephemeral: true
+            // 最終的な応答を送信
+            await interaction.editReply({
+                content: `## 🚨 現在の連投規制設定\n\n- **規制時間 (タイムフレーム):** ${displayTime}\n- **連投回数 (リミット):** ${settings.limit}回\n- **規制動作 (アクション):** ${settings.action}`
             });
         }
     }
