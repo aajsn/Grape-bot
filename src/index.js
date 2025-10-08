@@ -224,13 +224,20 @@ client.on('interactionCreate', async interaction => {
         
         // 常に権限チェックを行う
         if (!interaction.memberPermissions.has('Administrator')) {
-            // ★★★ [変更] 権限エラー応答はEphemeralのままにしておく (セキュリティ上の理由) ★★★
+            // 権限エラー応答はEphemeralのままにしておく (セキュリティ上の理由)
             return interaction.reply({ content: 'このコマンドを実行するには管理者権限が必要です。', ephemeral: true });
         }
         
-        // deferReplyで処理中の応答を保証。ここではEphemeralを外す！
-        // ★★★ [変更] ephemeral: false を明示的に指定しない（デフォルトの動作にする） ★★★
-        await interaction.deferReply(); 
+        // ★★★ [修正点1] deferReplyで公開応答を強制するロジック ★★★
+        let isEphemeral = false;
+        // /spam-config set は管理者向けの設定なのでEphemeralのままにする
+        if (commandName === 'spam-config' && interaction.options.getSubcommand(false) === 'set') {
+            isEphemeral = true;
+        }
+
+        await interaction.deferReply({
+            ephemeral: isEphemeral
+        }); 
 
         // /spam-config コマンドの処理
         if (commandName === 'spam-config') {
@@ -286,7 +293,7 @@ client.on('interactionCreate', async interaction => {
                     await saveSpamSettings(guildId, settings);
                 }
 
-                // ★★★ [変更] setコマンドの結果はEphemeralのままにしておく (設定変更は管理者のみに関係するため) ★★★
+                // setコマンドの結果はEphemeralのまま
                 await interaction.editReply({
                     content: replyContent
                 });
@@ -296,10 +303,10 @@ client.on('interactionCreate', async interaction => {
                     ? `${settings.timeframe}ミリ秒`
                     : `${(settings.timeframe / 1000).toFixed(1)}秒`;
 
-                // ★★★ [変更] showコマンドの結果は全員に見えるようにする ★★★
+                // showコマンドの結果は全員に見える（deferReplyでephemeral: falseが適用されている）
                 await interaction.editReply({
                     content: `## 🚨 現在の連投規制設定\n\n- **規制時間 (タイムフレーム):** ${displayTime}\n- **連投回数 (リミット):** ${settings.limit}回\n- **規制動作 (アクション):** ${settings.action}`,
-                    ephemeral: false // 公開応答にする
+                    ephemeral: false // ★★★ [修正点2] 念のためここでも公開を保証 ★★★
                 });
             }
         
@@ -330,7 +337,7 @@ client.on('interactionCreate', async interaction => {
                 
                 const deleteCount = deleted.size;
                 
-                // ★★★ ログEmbedを作成 ★★★
+                // ログEmbedを作成
                 const logEmbed = new EmbedBuilder()
                     .setColor(0xFF0000) // 赤色
                     .setTitle('🗑️ メッセージ一括削除 (Purge) ログ')
@@ -345,11 +352,11 @@ client.on('interactionCreate', async interaction => {
                     .setTimestamp();
                 
                 
-                // ★★★ [変更] 全員に見える公開応答にする ★★★
+                // 全員に見える公開応答にする
                 await interaction.editReply({ 
                     content: `✅ 削除が完了しました。**${deleteCount}件**のメッセージを削除しました。`,
                     embeds: [logEmbed],
-                    ephemeral: false // 公開応答にする
+                    ephemeral: false // ★★★ [修正点3] ここでも公開を保証 ★★★
                 });
 
                 // 5秒後に確認メッセージを自動で削除 (Wick風の動作)
