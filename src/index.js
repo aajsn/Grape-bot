@@ -1,30 +1,63 @@
 // Discord Bot Main Script (index.js)
-// 変更点: message-delete コマンドの実行ロジックをループ処理に変更し、最大1000件の削除に対応
+// 修正点: Firebase初期化時のエラー（projectId not provided, モジュール見つからないなど）をキャッチし、Botがクラッシュするのを防ぐ
 
 // --- Import Modules ---
 import { Client, GatewayIntentBits, Collection, REST, Routes, ChannelType, PermissionsBitField, EmbedBuilder } from 'discord.js';
-import { initializeApp } from 'firebase/app';
-import { getAuth, signInAnonymously, signInWithCustomToken } from 'firebase/auth';
-import { getFirestore, doc, setDoc, getDoc } from 'firebase/firestore';
+// Firebaseのインポートにtry-catchブロックを追加 (モジュールが見つからないエラー対策)
+let firebase = {};
+try {
+    const firebaseAppModule = await import('firebase/app');
+    const authModule = await import('firebase/auth');
+    const firestoreModule = await import('firebase/firestore');
+    
+    firebase = {
+        initializeApp: firebaseAppModule.initializeApp,
+        getAuth: authModule.getAuth,
+        signInAnonymously: authModule.signInAnonymously,
+        signInWithCustomToken: authModule.signInWithCustomToken,
+        getFirestore: firestoreModule.getFirestore,
+        doc: firestoreModule.doc,
+        setDoc: firestoreModule.setDoc,
+        getDoc: firestoreModule.getDoc,
+    };
+} catch (e) {
+    console.error("Firebase Module Load Error: Firebase関連の処理は無効になります。", e);
+}
+
 
 // --- Firebase & Config Setup ---
 // グローバル変数が定義されていない場合のフォールバック
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
 const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
 
-// Firebaseの初期化
-const firebaseApp = initializeApp(firebaseConfig);
-const db = getFirestore(firebaseApp);
-const auth = getAuth(firebaseApp);
+let firebaseApp, db, auth;
+
+// Firebaseの初期化をtry-catchで囲む
+try {
+    if (firebase.initializeApp && firebaseConfig.projectId) {
+        firebaseApp = firebase.initializeApp(firebaseConfig);
+        db = firebase.getFirestore(firebaseApp);
+        auth = firebase.getAuth(firebaseApp);
+    } else {
+        console.warn("⚠️ Firebase Warning: projectIdがないか、モジュールのロードに失敗したため、Firestore/Authは使用できません。");
+    }
+} catch (e) {
+    console.error("Firebase Initialization Error:", e);
+}
+
 
 // 認証トークンを使用してサインイン、または匿名サインイン
 async function firebaseAuth() {
+    if (!auth) {
+        console.log("Firebase Auth Skipped: Firebaseが初期化されていません。");
+        return;
+    }
     try {
         if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-            await signInWithCustomToken(auth, __initial_auth_token);
+            await firebase.signInWithCustomToken(auth, __initial_auth_token);
             console.log("Firebase: Signed in with custom token.");
         } else {
-            await signInAnonymously(auth);
+            await firebase.signInAnonymously(auth);
             console.log("Firebase: Signed in anonymously.");
         }
     } catch (error) {
@@ -57,12 +90,27 @@ const userMessageHistory = new Map(); // Map<guildId, Map<userId, messageContent
 
 
 // --- Firestore Functions ---
+// Firestoreが利用可能かチェックするラッパー関数
+function isFirestoreAvailable(interaction = null) {
+    if (!db) {
+        const message = '❌ **Firestoreエラー:** Firebaseが正しく初期化されていません。設定（特に`projectId`）を確認してください。';
+        if (interaction && interaction.deferred) {
+            interaction.editReply({ content: message, ephemeral: true }).catch(e => console.error("Error replying to Firestore error:", e));
+        } else if (interaction) {
+            interaction.reply({ content: message, ephemeral: true }).catch(e => console.error("Error replying to Firestore error:", e));
+        }
+        return false;
+    }
+    return true;
+}
+
 
 // スパム設定を取得 (デフォルト: 閾値5, アクション: warn)
 async function getSpamSettings(guildId) {
-    const docRef = doc(db, SPAM_SETTINGS_PATH, guildId);
+    if (!isFirestoreAvailable()) return { threshold: 5, action: 'warn' };
+    const docRef = firebase.doc(db, SPAM_SETTINGS_PATH, guildId);
     try {
-        const docSnap = await getDoc(docRef);
+        const docSnap = await firebase.getDoc(docRef);
         return docSnap.exists() ? docSnap.data() : { threshold: 5, action: 'warn' };
     } catch (e) {
         console.error("Error fetching spam settings:", e);
@@ -72,9 +120,10 @@ async function getSpamSettings(guildId) {
 
 // レートリミット設定を取得 (デフォルト: 最小間隔0ms, アクション: warn)
 async function getRateLimitSettings(guildId) {
-    const docRef = doc(db, RATE_LIMIT_PATH, guildId);
+    if (!isFirestoreAvailable()) return { milliseconds: 0, action: 'warn' };
+    const docRef = firebase.doc(db, RATE_LIMIT_PATH, guildId);
     try {
-        const docSnap = await getDoc(docRef);
+        const docSnap = await firebase.getDoc(docRef);
         // デフォルト: 最小間隔なし (0ms), アクションは警告
         return docSnap.exists() ? docSnap.data() : { milliseconds: 0, action: 'warn' }; 
     } catch (e) {
@@ -85,16 +134,18 @@ async function getRateLimitSettings(guildId) {
 
 // スパム設定を保存
 async function saveSpamSettings(guildId, threshold, action) {
-    const docRef = doc(db, SPAM_SETTINGS_PATH, guildId);
+    if (!isFirestoreAvailable()) return;
+    const docRef = firebase.doc(db, SPAM_SETTINGS_PATH, guildId);
     const userId = auth.currentUser?.uid || 'anonymous-user';
-    await setDoc(docRef, { threshold, action, updatedBy: userId, updatedAt: new Date() });
+    await firebase.setDoc(docRef, { threshold, action, updatedBy: userId, updatedAt: new Date() });
 }
 
 // レートリミット設定を保存
 async function saveRateLimitSettings(guildId, milliseconds, action) {
-    const docRef = doc(db, RATE_LIMIT_PATH, guildId);
+    if (!isFirestoreAvailable()) return;
+    const docRef = firebase.doc(db, RATE_LIMIT_PATH, guildId);
     const userId = auth.currentUser?.uid || 'anonymous-user';
-    await setDoc(docRef, { milliseconds, action, updatedBy: userId, updatedAt: new Date() });
+    await firebase.setDoc(docRef, { milliseconds, action, updatedBy: userId, updatedAt: new Date() });
 }
 
 // --- Spam Detection Logic (Simplistic Example) ---
@@ -107,7 +158,7 @@ function isSpam(content) {
     return hasLink || (upperCaseCount / content.length > 0.3);
 }
 
-// --- Command Definition and Registration ---
+// --- Command Definition and Registration (省略) ---
 const commands = [
     {
         name: 'set-spam-threshold',
@@ -249,6 +300,8 @@ client.on('interactionCreate', async interaction => {
 
         // --- /set-spam-threshold ---
         if (commandName === 'set-spam-threshold') {
+            if (!isFirestoreAvailable(interaction)) return;
+
             const threshold = options.getInteger('value');
             if (threshold < 1 || threshold > 10) {
                 return interaction.editReply('❌ **エラー:** しきい値は1から10の間に設定してください。');
@@ -260,6 +313,8 @@ client.on('interactionCreate', async interaction => {
 
         // --- /set-spam-action ---
         else if (commandName === 'set-spam-action') {
+            if (!isFirestoreAvailable(interaction)) return;
+            
             const action = options.getString('action');
             const settings = await getSpamSettings(guildId);
             await saveSpamSettings(guildId, settings.threshold, action);
@@ -268,6 +323,8 @@ client.on('interactionCreate', async interaction => {
 
         // --- /set-rate-limit ---
         else if (commandName === 'set-rate-limit') {
+            if (!isFirestoreAvailable(interaction)) return;
+
             const milliseconds = options.getInteger('milliseconds');
             const action = options.getString('limit_action');
 
@@ -275,7 +332,7 @@ client.on('interactionCreate', async interaction => {
                 return interaction.editReply('❌ **エラー:** ミリ秒は0以上の値を設定してください。');
             }
             if (milliseconds < 300 && milliseconds !== 0) {
-                await interaction.editReply(`⚠️ **注意:** ${milliseconds} ミリ秒はBotが不安定になる可能性があります。`);
+                await interaction.followUp(`⚠️ **注意:** ${milliseconds} ミリ秒はBotが不安定になる可能性があります。`);
             }
             
             await saveRateLimitSettings(guildId, milliseconds, action);
@@ -284,13 +341,14 @@ client.on('interactionCreate', async interaction => {
 
         // --- /show-spam-settings ---
         else if (commandName === 'show-spam-settings') {
+            // Firestoreが利用できない場合でも、代わりにデフォルト設定を表示する
             const spamSettings = await getSpamSettings(guildId);
             const rateLimitSettings = await getRateLimitSettings(guildId);
             
             const embed = new EmbedBuilder()
-                .setColor(0x0099FF)
+                .setColor(db ? 0x0099FF : 0xFFCC00)
                 .setTitle('📝 現在のスパム対策設定')
-                .setDescription(`このサーバーにおける現在の設定を表示しています。`)
+                .setDescription(db ? `このサーバーにおける現在の設定を表示しています。` : '⚠️ **Firebaseが利用できないため、デフォルト設定を表示しています。** 設定の保存・取得はできません。')
                 .addFields(
                     { name: 'スパム判定のしきい値', value: `${spamSettings.threshold} / 10`, inline: true },
                     { name: 'スパム検出時のアクション', value: `**${spamSettings.action.toUpperCase()}**`, inline: true },
@@ -298,7 +356,7 @@ client.on('interactionCreate', async interaction => {
                     { name: '最小投稿間隔 (連投規制)', value: `${rateLimitSettings.milliseconds} ミリ秒`, inline: true },
                     { name: '規制時のアクション', value: `**${rateLimitSettings.action.toUpperCase()}**`, inline: true },
                 )
-                .setFooter({ text: '設定はFirebase Firestoreに保存されています' })
+                .setFooter({ text: db ? '設定はFirebase Firestoreに保存されています' : 'Firebase未初期化' })
                 .setTimestamp();
 
             interaction.editReply({ embeds: [embed] });
@@ -315,6 +373,7 @@ client.on('interactionCreate', async interaction => {
             }
             if (count > 1000) {
                 count = 1000;
+                // deferReplyの後にfollowUpを使う
                 await interaction.followUp({ content: '⚠️ **警告:** 一度の削除上限は1000件です。削除件数を1000に制限しました。', ephemeral: true });
             }
 
@@ -406,15 +465,23 @@ client.on('interactionCreate', async interaction => {
 client.on('messageCreate', async message => {
     if (message.author.bot || !message.guild || message.system) return;
 
+    // Botにメッセージを削除する権限があるかチェック (Firestoreが使えない場合はデフォルト設定で動作)
+    if (!message.guild.members.me.permissions.has(PermissionsBitField.Flags.ManageMessages)) {
+        return;
+    }
+    
+    // Firestoreが利用不可な場合は、スパム対策ロジック全体をスキップ
+    if (!db) {
+        console.log("Firestore not available. Skipping spam and rate limit checks.");
+        return;
+    }
+
+
     const guildId = message.guild.id;
     const userId = message.author.id;
     const content = message.content;
     const now = Date.now();
     
-    // Botにメッセージを削除する権限があるかチェック
-    if (!message.guild.members.me.permissions.has(PermissionsBitField.Flags.ManageMessages)) {
-        return;
-    }
 
     // 1. --- 連投規制 (レートリミット) チェック ---
     const rateLimitSettings = await getRateLimitSettings(guildId);
@@ -429,8 +496,8 @@ client.on('messageCreate', async message => {
             if (rateAction === 'delete') {
                 await message.delete().catch(e => console.error('Delete message error (Rate Limit):', e));
             } else if (rateAction === 'warn') {
-                message.reply(`🚨 **警告:** ${minInterval}ms 未満の連続投稿を検出しました。間隔を空けてください。`)
-                      .then(reply => setTimeout(() => reply.delete().catch(e => e), 5000))
+                // 警告メッセージは永続化
+                message.reply(`🚨 **警告 (連投規制):** ${minInterval}ms 未満の連続投稿を検出しました。間隔を空けてください。`)
                       .catch(e => console.error('Warn message error (Rate Limit):', e));
             }
             lastUserMessage.set(userId, now);
@@ -474,8 +541,8 @@ client.on('messageCreate', async message => {
             }
             guildHistory.set(userId, []);
         } else if (spamAction === 'warn') {
-            message.reply(`🚨 **警告:** 連続したスパム行為を検出しました (${spamCount}/10)。行為を停止してください。`)
-                  .then(reply => setTimeout(() => reply.delete().catch(e => e), 5000))
+            // 警告メッセージは永続化
+            message.reply(`🚨 **警告 (スパム検出):** 連続したスパム行為を検出しました (${spamCount}/10)。行為を停止してください。`)
                   .catch(e => console.error('Warn message error (Spam Threshold):', e));
         }
     }
