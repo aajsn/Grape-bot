@@ -2,7 +2,7 @@
 const { Client, GatewayIntentBits, SlashCommandBuilder } = require('discord.js');
 // Firebase Admin SDKのコアモジュール全体をインポートします
 const admin = require('firebase-admin');
-// ★★★ Replit/Glitch対応のために http モジュールをインポート ★★★
+// ★★★ Render/Replit対応のために http モジュールをインポート ★★★
 const http = require('http');
 
 // 環境変数を取得します
@@ -51,11 +51,9 @@ const client = new Client({
 // プログラムのどこかで予期せぬエラーが発生しても、Bot全体が落ちるのを防ぎます
 process.on('unhandledRejection', error => {
     console.error('Unhandled promise rejection (予期せぬエラー):', error);
-    // Render/ReplitでBotがクラッシュするのを防ぎ、処理を続行します
 });
 process.on('uncaughtException', error => {
     console.error('Uncaught Exception (捕捉されていない例外):', error);
-    // Botがクラッシュするのを防ぎ、処理を続行します
 });
 // ********************************************
 
@@ -93,10 +91,23 @@ client.once('ready', async () => {
                 .setDescription('現在の連投規制設定を表示します。')
         );
 
+    // ★★★ [追加] メッセージ削除（パージ）コマンドの定義 ★★★
+    const purgeCommand = new SlashCommandBuilder()
+        .setName('purge')
+        .setDescription('指定された数のメッセージを一括削除します（最大99件）。')
+        .setDefaultMemberPermissions(0) // デフォルトで管理者権限が必要
+        .addIntegerOption(option =>
+            option.setName('count')
+                .setDescription('削除するメッセージの数 (2～99)')
+                .setRequired(true)
+                .setMinValue(2)
+                .setMaxValue(99)
+        );
 
     try {
         await client.application.commands.set([
-            spamConfigCommand
+            spamConfigCommand,
+            purgeCommand // 新しいコマンドを登録リストに追加
         ]);
         console.log('スラッシュコマンドの登録が完了しました。');
     } catch (e) {
@@ -145,12 +156,9 @@ async function saveSpamSettings(guildId, settings) {
 const userMessageHistory = new Map();
 
 client.on('messageCreate', async message => {
-    // messageCreateイベント全体をtry-catchで囲み、Botのクラッシュを防ぐ
     try {
-        // Bot自身のメッセージやDMは無視
         if (message.author.bot || !message.guild) return;
 
-        // メンバーオブジェクトがない場合は取得を試みる (タイムアウト処理のため)
         if (!message.member) {
             try {
                 message.member = await message.guild.members.fetch(message.author.id);
@@ -167,73 +175,61 @@ client.on('messageCreate', async message => {
         const settings = await getSpamSettings(guildId);
         const { timeframe, limit, action } = settings;
 
-        // ユーザーの履歴を取得
         let history = userMessageHistory.get(userId) || [];
         history = history.filter(timestamp => currentTimestamp - timestamp < timeframe);
         history.push(currentTimestamp);
         userMessageHistory.set(userId, history);
 
-        // 連投と見なされるかチェック
         if (history.length > limit) {
             console.log(`連投を検出: ユーザー ${message.author.tag} が ${timeframe}ms に ${history.length} 回送信しました。`);
 
             if (action === 'delete') {
-                // メッセージ削除アクション
                 const messagesToDelete = await message.channel.messages.fetch({ limit: history.length });
                 messagesToDelete.forEach(msg => {
-                    // 確実に連投ユーザーのメッセージのみを削除し、エラーを無視
                     if (msg.author.id === userId) {
                         msg.delete().catch(err => console.error("メッセージ削除エラー (権限不足等):", err));
                     }
                 });
                 message.channel.send(`🚨 **連投検知:** ${message.author} のメッセージが ${timeframe}ms 以内に ${limit} 回を超えたため削除しました。`).then(m => setTimeout(() => m.delete(), 5000));
             } else if (action === 'timeout') {
-                // タイムアウトアクション
                 const timeoutDuration = 60000; // 60秒
                 if (message.member) {
-                    // ★タイムアウト処理をtry-catchで囲み、プログラム全体が落ちるのを防ぐ★
                     try {
                         await message.member.timeout(timeoutDuration, '連投規制違反');
                         message.channel.send(`🚨 **連投検知:** ${message.author} を連投規制違反のため ${timeoutDuration / 1000}秒間タイムアウトしました。`).then(m => setTimeout(() => m.delete(), 5000));
                     } catch (err) {
-                        // 権限不足などでタイムアウトに失敗した場合
                         console.error("CRITICAL: タイムアウト処理エラー。Botがサーバーより権限が低い可能性があります。", err);
-                        // タイムアウト失敗時はメッセージ削除にフォールバックしてログを出す
                         message.channel.send(`🚨 **連投検知:** ${message.author} のタイムアウトに失敗しました。（Botの権限不足）代わりにメッセージを削除します。`).then(m => setTimeout(() => m.delete(), 5000));
                     }
                 } else {
                      console.error("Member object missing, cannot execute timeout action.");
                 }
             }
-
-            // 規制が発動したら、履歴をリセットしてペナルティ後のメッセージを許可する
             userMessageHistory.set(userId, []);
         }
     } catch (e) {
-        // messageCreateイベント全体のエラーをキャッチしてBotのクラッシュを防ぐ
         console.error("FATAL: messageCreateイベントで予期せぬエラーが発生しました。Botは続行します。", e);
     }
 });
 
 client.on('interactionCreate', async interaction => {
-    // interactionCreate全体をtry-catchで囲み、クラッシュを防ぐ
     try {
         if (!interaction.isCommand()) return;
         
         const { commandName } = interaction;
-        const guildId = interaction.guild.id;
         
         // 常に権限チェックを行う
         if (!interaction.memberPermissions.has('Administrator')) {
             return interaction.reply({ content: 'このコマンドを実行するには管理者権限が必要です。', ephemeral: true });
         }
         
+        // deferReplyで処理中の応答を保証
+        await interaction.deferReply({ ephemeral: true });
+
         // /spam-config コマンドの処理
         if (commandName === 'spam-config') {
             const subcommand = interaction.options.getSubcommand();
-            // deferReplyで処理中の応答を保証
-            await interaction.deferReply({ ephemeral: true });
-
+            const guildId = interaction.guild.id;
             let settings = await getSpamSettings(guildId);
 
             if (subcommand === 'set') {
@@ -243,6 +239,8 @@ client.on('interactionCreate', async interaction => {
                 
                 let replyContent = '設定が更新されました:';
                 let changed = false; 
+
+                // ... (spam-config set のロジックは省略 - 変更なし)
 
                 if (rate === null && limit === null) {
                     return interaction.editReply({ 
@@ -295,11 +293,38 @@ client.on('interactionCreate', async interaction => {
                     content: `## 🚨 現在の連投規制設定\n\n- **規制時間 (タイムフレーム):** ${displayTime}\n- **連投回数 (リミット):** ${settings.limit}回\n- **規制動作 (アクション):** ${settings.action}`
                 });
             }
+        
+        // ★★★ [追加] /purge コマンドの処理 ★★★
+        } else if (commandName === 'purge') {
+            const count = interaction.options.getInteger('count');
+            
+            if (count < 2 || count > 99) {
+                return interaction.editReply({ content: '削除できるメッセージ数は2件から99件の間です。', ephemeral: true });
+            }
+
+            try {
+                // メッセージを一括削除
+                const fetched = await interaction.channel.messages.fetch({ limit: count });
+                const deleted = await interaction.channel.bulkDelete(fetched, true); // 14日以上前のメッセージは無視
+                
+                const deleteCount = deleted.size;
+                const replyMessage = `${deleteCount}件のメッセージを削除しました。`;
+                
+                await interaction.editReply({ content: replyMessage });
+
+                // 5秒後に確認メッセージを削除
+                setTimeout(() => {
+                    interaction.deleteReply().catch(err => console.error("応答メッセージの削除に失敗しました。", err));
+                }, 5000);
+
+            } catch (error) {
+                console.error('メッセージ削除エラー:', error);
+                // 権限不足などで削除に失敗した場合
+                await interaction.editReply({ content: 'メッセージの削除に失敗しました。（Botに「メッセージの管理」権限があるか確認してください）' });
+            }
         }
     } catch (e) {
-         // interactionCreateイベント全体のエラーをキャッチ
          console.error("FATAL: interactionCreateイベントで予期せぬエラーが発生しました。Botは続行します。", e);
-         // 応答を試みる（既にdeferReply済みの場合、editReplyでエラーを通知）
          if (interaction.deferred || interaction.replied) {
              interaction.editReply({ content: 'コマンド実行中に予期せぬエラーが発生しました。', ephemeral: true }).catch(() => {});
          } else {
