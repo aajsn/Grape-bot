@@ -90,7 +90,7 @@ client.once('ready', async () => {
                 .setDescription('現在の連投規制設定を表示します。')
         );
 
-    // ★★★ [変更] /purge コマンドの定義 (ユーザー指定オプションを追加) ★★★
+    // /purge コマンドの定義
     const purgeCommand = new SlashCommandBuilder()
         .setName('purge')
         .setDescription('指定された数のメッセージを一括削除します（最大99件）。')
@@ -224,11 +224,13 @@ client.on('interactionCreate', async interaction => {
         
         // 常に権限チェックを行う
         if (!interaction.memberPermissions.has('Administrator')) {
+            // ★★★ [変更] 権限エラー応答はEphemeralのままにしておく (セキュリティ上の理由) ★★★
             return interaction.reply({ content: 'このコマンドを実行するには管理者権限が必要です。', ephemeral: true });
         }
         
-        // deferReplyで処理中の応答を保証
-        await interaction.deferReply({ ephemeral: true });
+        // deferReplyで処理中の応答を保証。ここではEphemeralを外す！
+        // ★★★ [変更] ephemeral: false を明示的に指定しない（デフォルトの動作にする） ★★★
+        await interaction.deferReply(); 
 
         // /spam-config コマンドの処理
         if (commandName === 'spam-config') {
@@ -284,6 +286,7 @@ client.on('interactionCreate', async interaction => {
                     await saveSpamSettings(guildId, settings);
                 }
 
+                // ★★★ [変更] setコマンドの結果はEphemeralのままにしておく (設定変更は管理者のみに関係するため) ★★★
                 await interaction.editReply({
                     content: replyContent
                 });
@@ -293,18 +296,21 @@ client.on('interactionCreate', async interaction => {
                     ? `${settings.timeframe}ミリ秒`
                     : `${(settings.timeframe / 1000).toFixed(1)}秒`;
 
+                // ★★★ [変更] showコマンドの結果は全員に見えるようにする ★★★
                 await interaction.editReply({
-                    content: `## 🚨 現在の連投規制設定\n\n- **規制時間 (タイムフレーム):** ${displayTime}\n- **連投回数 (リミット):** ${settings.limit}回\n- **規制動作 (アクション):** ${settings.action}`
+                    content: `## 🚨 現在の連投規制設定\n\n- **規制時間 (タイムフレーム):** ${displayTime}\n- **連投回数 (リミット):** ${settings.limit}回\n- **規制動作 (アクション):** ${settings.action}`,
+                    ephemeral: false // 公開応答にする
                 });
             }
         
-        // ★★★ [変更] /purge コマンドの処理 (ユーザー指定とログ出力) ★★★
+        // /purge コマンドの処理 
         } else if (commandName === 'purge') {
             const count = interaction.options.getInteger('count');
             const userToPurge = interaction.options.getUser('user');
             const targetUserId = userToPurge ? userToPurge.id : null;
             
             if (count < 2 || count > 99) {
+                // エラー応答はEphemeralのまま
                 return interaction.editReply({ content: '削除できるメッセージ数は2件から99件の間です。', ephemeral: true });
             }
 
@@ -339,27 +345,32 @@ client.on('interactionCreate', async interaction => {
                     .setTimestamp();
                 
                 
-                // ★★★ 管理者向け応答 ★★★
+                // ★★★ [変更] 全員に見える公開応答にする ★★★
                 await interaction.editReply({ 
                     content: `✅ 削除が完了しました。**${deleteCount}件**のメッセージを削除しました。`,
-                    embeds: [logEmbed] 
+                    embeds: [logEmbed],
+                    ephemeral: false // 公開応答にする
                 });
 
-                // 5秒後にembedメッセージを自動で削除
+                // 5秒後に確認メッセージを自動で削除 (Wick風の動作)
                 setTimeout(() => {
+                    // Bot自身が送った応答メッセージを削除
                     interaction.deleteReply().catch(err => console.error("応答メッセージの削除に失敗しました。", err));
                 }, 5000);
 
             } catch (error) {
                 console.error('メッセージ削除エラー:', error);
-                await interaction.editReply({ content: 'メッセージの削除に失敗しました。（Botに「メッセージの管理」権限があるか確認してください）' });
+                // エラー応答はEphemeralのまま
+                await interaction.editReply({ content: 'メッセージの削除に失敗しました。（Botに「メッセージの管理」権限があるか確認してください）', ephemeral: true });
             }
         }
     } catch (e) {
          console.error("FATAL: interactionCreateイベントで予期せぬエラーが発生しました。Botは続行します。", e);
          if (interaction.deferred || interaction.replied) {
+             // エラー応答はEphemeralのまま
              interaction.editReply({ content: 'コマンド実行中に予期せぬエラーが発生しました。', ephemeral: true }).catch(() => {});
          } else {
+             // エラー応答はEphemeralのまま
              interaction.reply({ content: 'コマンド実行中に予期せぬエラーが発生しました。', ephemeral: true }).catch(() => {});
          }
     }
