@@ -115,13 +115,19 @@ const commands = [
     },
     {
         name: 'message-delete',
-        description: '直近のメッセージを手動で削除します。',
+        description: 'チャンネルの直近メッセージを**一括削除 (Purge)** します。', // Purge対応
         options: [
             {
                 name: 'count',
                 type: 4, // Integer
-                description: '削除するメッセージの数 (1-1000)。', // ★修正: 上限を1000に変更
+                description: '削除するメッセージの数 (1-1000)。',
                 required: true,
+            },
+            {
+                name: 'user',
+                type: 6, // User
+                description: '特定のユーザーのメッセージのみを削除します。',
+                required: false,
             },
         ],
     },
@@ -208,7 +214,14 @@ client.on('interactionCreate', async interaction => {
     }
 
     try {
-        await interaction.deferReply({ ephemeral: true });
+        // デフォルトで公開応答（ephemeral: false）を設定
+        let isEphemeral = true; // デフォルトはEphemeral
+        if (commandName === 'message-delete' || commandName === 'show-spam-settings') {
+            isEphemeral = false; // これらのコマンドは公開にする
+        }
+        
+        // deferReplyを先に実行
+        await interaction.deferReply({ ephemeral: isEphemeral }); 
 
         // --- /set-spam-threshold ---
         if (commandName === 'set-spam-threshold') {
@@ -260,17 +273,22 @@ client.on('interactionCreate', async interaction => {
             response += `   * (0に設定されている場合、連投規制は無効です)\n`;
             response += `**④ 規制時のアクション:** **${rateLimitSettings.action.toUpperCase()}**\n`;
 
+            // ephemeral: false は deferReplyで既に設定されている
             interaction.editReply(response);
         }
 
         // --- /message-delete ---
         else if (commandName === 'message-delete') {
             const count = options.getInteger('count');
+            const userToPurge = options.getUser('user');
+            const targetUserId = userToPurge ? userToPurge.id : null;
+            
             const maxDelete = 1000;
             const batchSize = 100;
             
             if (count < 1 || count > maxDelete) {
-                return interaction.editReply(`❌ **エラー:** 削除できるメッセージの数は1から${maxDelete}までです。`);
+                // エラー応答はEphemeralのままにしておく
+                return interaction.editReply({ content: `❌ **エラー:** 削除できるメッセージの数は1から${maxDelete}までです。`, ephemeral: true });
             }
 
             try {
@@ -278,132 +296,54 @@ client.on('interactionCreate', async interaction => {
                 let messagesRemaining = count;
                 let lastMessageId = interaction.id; // コマンドメッセージより前のメッセージから取得を開始
 
+                // --- 削除メッセージ収集ループ ---
+                const messagesToBulkDelete = []; // 一括削除対象のメッセージIDリスト
+
                 while (messagesRemaining > 0) {
                     const fetchLimit = Math.min(batchSize, messagesRemaining);
                     
-                    // メッセージを取得（最大100件）
                     const fetched = await channel.messages.fetch({ 
                         limit: fetchLimit, 
                         before: lastMessageId 
                     });
 
-                    if (fetched.size === 0) break; // もうメッセージがない場合、ループを終了
+                    if (fetched.size === 0) break; 
 
-                    // 一括削除を実行
-                    // filterOutOlder: true を設定しているため、14日以上前のメッセージは自動で除外される
-                    const deleted = await channel.bulkDelete(fetched, true);
+                    let currentBatch = fetched;
+
+                    // ユーザー指定がある場合、フィルタリング
+                    if (targetUserId) {
+                        currentBatch = fetched.filter(msg => msg.author.id === targetUserId);
+                    }
                     
-                    totalDeleted += deleted.size;
+                    // 削除対象のIDをリストに追加
+                    currentBatch.forEach(msg => messagesToBulkDelete.push(msg.id));
+
                     messagesRemaining -= fetched.size;
                     lastMessageId = fetched.last().id;
 
-                    // 14日以上前のメッセージしか残っておらず削除件数が0の場合、無限ループを防ぐために終了
-                    // または、fetchしたメッセージのうち、一部しか削除されなかった場合（14日制限に達した可能性が高いため）終了
-                    if (fetched.size > 0 && deleted.size < fetched.size) {
-                        break;
-                    }
+                    // 14日以上前のメッセージしか残っておらず、次のループが期待できない場合は終了
+                    if (fetched.size < fetchLimit) break;
                 }
                 
-                // 応答メッセージを送信
-                interaction.editReply(`✅ **成功:** 直近のメッセージ **${totalDeleted} 件** (最大${maxDelete}件まで) を削除しました。\n*注: Discordの制限により、削除対象は過去14日以内のメッセージに限られます。*`);
+                // --- 実際の削除 ---
+                const deletedMessages = await channel.bulkDelete(messagesToBulkDelete, true);
                 
-            } catch (error) {
-                console.error('メッセージ削除エラー:', error);
-                // エラー応答はEphemeralのまま
-                await interaction.editReply({ content: '❌ **エラー:** メッセージの削除に失敗しました。（Botに「メッセージの管理」権限があるか、API制限に達していないか確認してください）', ephemeral: true });
-            }
-        }
-
-    } catch (error) {
-        console.error('Interaction Error:', error);
-        if (!interaction.deferred || interaction.ephemeral) {
-             interaction.reply({ content: '❌ **エラー:** コマンドの実行中に問題が発生しました。権限とログを確認してください。', ephemeral: true }).catch(e => console.error("Error replying to interaction:", e));
-        } else {
-             interaction.editReply('❌ **エラー:** コマンドの実行中に問題が発生しました。権限とログを確認してください。').catch(e => console.error("Error editing interaction reply:", e));
-        }
-    }
-});
-
-client.on('messageCreate', async message => {
-    if (message.author.bot || !message.guild) return;
-
-    const guildId = message.guild.id;
-    const userId = message.author.id;
-    const content = message.content;
-    const now = Date.now();
-    let actionExecuted = false; // アクションが実行されたかどうかを追跡
-
-    // 1. --- 連投規制 (レートリミット) チェック ---
-    const rateLimitSettings = await getRateLimitSettings(guildId);
-    const minInterval = rateLimitSettings.milliseconds;
-    const rateAction = rateLimitSettings.action;
-    
-    if (minInterval > 0) {
-        const lastTime = lastUserMessage.get(userId) || 0;
-        if (now - lastTime < minInterval) {
-            console.log(`Rate Limit triggered for ${message.author.tag}`);
-            
-            if (rateAction === 'delete') {
-                await message.delete().catch(e => console.error('Delete message error (Rate Limit):', e));
-                actionExecuted = true;
-            } else if (rateAction === 'warn') {
-                message.reply(`🚨 **警告:** ${minInterval}ms 未満の連続投稿を検出しました。間隔を空けてください。`).catch(e => console.error('Warn message error (Rate Limit):', e));
-                actionExecuted = true;
-            }
-            // 規制が発動した場合、メッセージ履歴の更新は行わない（スパムと見なすため）
-            // 処理を継続すると、スパム判定も同時に実行されてしまうため、ここで終了
-            lastUserMessage.set(userId, now); // タイムアウト後もすぐに次の投稿を防ぐため時刻を更新
-            return;
-        }
-        lastUserMessage.set(userId, now); // 規制が発動しなかった場合は時刻を更新
-    }
-
-    // 2. --- スパムしきい値チェック ---
-    const spamSettings = await getSpamSettings(guildId);
-    const threshold = spamSettings.threshold;
-    const spamAction = spamSettings.action;
-
-    if (!userMessageHistory.has(guildId)) {
-        userMessageHistory.set(guildId, new Map());
-    }
-    const guildHistory = userMessageHistory.get(guildId);
-    if (!guildHistory.has(userId)) {
-        guildHistory.set(userId, []);
-    }
-    const history = guildHistory.get(userId);
-
-    // 履歴にメッセージを追加 (最新10件を保持)
-    history.push(content);
-    if (history.length > 10) {
-        history.shift();
-    }
-    guildHistory.set(userId, history); // 履歴を更新
-
-    // スパムメッセージの数をカウント
-    let spamCount = history.filter(isSpam).length;
-
-    // しきい値を超えたかチェック
-    if (spamCount >= threshold && history.length >= 10 && !actionExecuted) {
-        console.log(`Spam Threshold triggered for ${message.author.tag}. Count: ${spamCount}`);
-        
-        // 過去10件のメッセージを取得して処理
-        const messages = await message.channel.messages.fetch({ limit: 10 });
-        const userMessages = messages.filter(m => m.author.id === userId);
-
-        if (spamAction === 'delete') {
-            await message.channel.bulkDelete(userMessages, true)
-                .then(() => console.log(`Deleted ${userMessages.size} messages from ${message.author.tag}`))
-                .catch(e => console.error('Bulk delete error (Spam Threshold):', e));
-
-            // 削除後、ユーザーの履歴をクリア
-            guildHistory.set(userId, []);
-        } else if (spamAction === 'warn') {
-            message.reply(`🚨 **警告:** 連続したスパム行為を検出しました (${spamCount}/10)。行為を停止してください。`)
-                .catch(e => console.error('Warn message error (Spam Threshold):', e));
-        }
-    }
-});
-
-client.login(TOKEN).catch(err => {
-    console.error("Bot Login Error (Check DISCORD_TOKEN and Intents):", err);
-});
+                // --- ログEmbedの作成 ---
+                const logEmbed = {
+                    color: 0xFF0000, 
+                    title: '🗑️ メッセージ一括削除 (Purge) ログ', // Purge対応
+                    description: `**${channel.name}** チャンネルでメッセージが削除されました。`,
+                    fields: [
+                        { name: '実行者', value: interaction.user.tag, inline: true },
+                        { name: '削除件数', value: `${deletedMessages.size}件`, inline: true }, // 実際に削除された件数
+                        { name: '対象ユーザー', value: targetUserId ? `<@${targetUserId}>` : '全員', inline: true },
+                        { name: '削除されたチャンネル', value: `<#${channel.id}>`, inline: true },
+                        { name: 'コマンド実行日時', value: new Date().toISOString(), inline: false }
+                    ],
+                    timestamp: new Date().toISOString(),
+                };
+                
+                // --- 応答メッセージの公開（永続化） ---
+                await interaction.editReply({ 
+                    content: `✅ **一括削除 (Purge) 完了:** 過去14日以内のメッセージ **${deletedMessages.size} 件**を削除しました。 (指定件
