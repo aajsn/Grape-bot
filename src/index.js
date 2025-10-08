@@ -1,407 +1,409 @@
-// Discord.jsをCommonJS形式で読み込みます
-const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
-// Firebase Admin SDKのコアモジュール全体をインポートします
-const admin = require('firebase-admin');
-// ★★★ Render/Replit対応のために http モジュールをインポート ★★★
-const http = require('http');
+// Discord Bot Main Script (index.js)
+import { Client, GatewayIntentBits, Collection, REST, Routes } from 'discord.js';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken } from 'firebase/auth';
+import { getFirestore, doc, setDoc, getDoc, collection, query, where, getDocs, deleteDoc, runTransaction } from 'firebase/firestore';
 
-// 環境変数を取得します
-const token = process.env.DISCORD_TOKEN;
-const firebaseServiceAccount = process.env.FIREBASE_SERVICE_ACCOUNT;
+// --- Firebase & Config Setup ---
+// グローバル変数が定義されていない場合のフォールバック
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
 
-// Firestoreのサービスアカウント情報（JSON）を解析します
-let serviceAccount;
-try {
-    // 環境変数から取得した一行JSONをパースします
-    serviceAccount = JSON.parse(firebaseServiceAccount);
-} catch (error) {
-    console.error("Firebase Service Accountのパースに失敗しました。環境変数を確認してください。");
-    console.error(error);
-    process.exit(1); 
+// Firebaseの初期化
+const firebaseApp = initializeApp(firebaseConfig);
+const db = getFirestore(firebaseApp);
+const auth = getAuth(firebaseApp);
+
+// 認証トークンを使用してサインイン、または匿名サインイン
+async function firebaseAuth() {
+    try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+            await signInWithCustomToken(auth, __initial_auth_token);
+            console.log("Firebase: Signed in with custom token.");
+        } else {
+            await signInAnonymously(auth);
+            console.log("Firebase: Signed in anonymously.");
+        }
+    } catch (error) {
+        console.error("Firebase Auth Error:", error);
+    }
 }
+firebaseAuth();
 
-// Firebaseの初期化とFirestoreへの接続
-const app = admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
-});
-const db = admin.firestore(app);
-const collection = db.collection.bind(db); 
+const userId = auth.currentUser?.uid || 'anonymous-user';
 
-// データベースのコレクション名
-const SETTINGS_COLLECTION = 'spam_settings';
-const DEFAULT_SETTINGS = {
-    timeframe: 2000, // 2000ミリ秒 (2秒)
-    limit: 5,        // 5回
-    action: 'timeout'   // デフォルトのアクション 
-};
+// Botのトークンは環境変数から取得
+const TOKEN = process.env.DISCORD_TOKEN;
 
-// Discordクライアントの初期化
+// スパム対策の設定とレートリミット設定を保存するコレクションパス
+const SPAM_SETTINGS_PATH = `artifacts/${appId}/public/data/spam_settings`;
+const RATE_LIMIT_PATH = `artifacts/${appId}/public/data/rate_limits`;
+
+// --- Bot Client Setup ---
 const client = new Client({
     intents: [
+        // 必須のインテント
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildMembers // タイムアウト処理に必要
-    ]
+        // 特権インテント (Developer Portalで有効化が必要)
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.GuildPresences,
+    ],
 });
 
-// ********************************************
-// ★★★ [重要] 未処理の例外をキャッチしてクラッシュを防ぐロジックの追加 ★★★
-// ********************************************
-process.on('unhandledRejection', error => {
-    console.error('Unhandled promise rejection (予期せぬエラー):', error);
-});
-process.on('uncaughtException', error => {
-    console.error('Uncaught Exception (捕捉されていない例外):', error);
-});
-// ********************************************
+client.commands = new Collection();
+const cooldowns = new Collection();
+const lastUserMessage = new Map(); // ユーザーごとの最後のメッセージ時刻を記録 (連投規制用)
 
-// Botが起動した時の処理
-client.once('ready', async () => {
-    console.log('Botが起動しました:', client.user.tag);
+// --- Command Definition and Registration ---
+const commands = [
+    {
+        name: 'set-spam-threshold',
+        description: 'スパム判定のしきい値（直近10件中、何件以上でアクション）を設定します。',
+        options: [
+            {
+                name: 'value',
+                type: 4, // Integer
+                description: 'しきい値 (1-10)。例: 5 (10件中5件以上でアクション)',
+                required: true,
+            },
+        ],
+    },
+    {
+        name: 'set-spam-action',
+        description: 'スパム検出時のアクション（削除/警告）を設定します。',
+        options: [
+            {
+                name: 'action',
+                type: 3, // String
+                description: 'アクション: delete (削除) または warn (警告)',
+                required: true,
+                choices: [
+                    { name: 'delete', value: 'delete' },
+                    { name: 'warn', value: 'warn' },
+                ],
+            },
+        ],
+    },
+    {
+        // === 新しいミリ秒単位のレートリミットコマンド ===
+        name: 'set-rate-limit',
+        description: '連投規制のしきい値（ミリ秒単位）を設定します。',
+        options: [
+            {
+                name: 'milliseconds',
+                type: 4, // Integer
+                description: '次のメッセージまでの最小間隔（ミリ秒）。例: 500 (0.5秒)',
+                required: true,
+            },
+            {
+                name: 'limit_action',
+                type: 3, // String
+                description: '規制時のアクション: delete (削除) または warn (警告)',
+                required: true,
+                choices: [
+                    { name: 'delete', value: 'delete' },
+                    { name: 'warn', value: 'warn' },
+                ],
+            },
+        ],
+    },
+    {
+        name: 'show-spam-settings',
+        description: '現在のスパム対策とレートリミットの設定を確認します。',
+    },
+    {
+        name: 'message-delete',
+        description: '直近のメッセージを手動で削除します。',
+        options: [
+            {
+                name: 'count',
+                type: 4, // Integer
+                description: '削除するメッセージの数 (1-1000)。', // ★修正: 上限を1000に変更
+                required: true,
+            },
+        ],
+    },
+];
 
-    // /spam-config コマンドの定義
-    const spamConfigCommand = new SlashCommandBuilder()
-        .setName('spam-config')
-        .setDescription('連投規制の設定を管理します。')
-        .setDefaultMemberPermissions(0) // デフォルトで管理者権限が必要
-        .addSubcommand(subcommand =>
-            subcommand.setName('set')
-                 .setDescription('連投規制のルール（時間、回数、動作）を変更します。')
-                .addIntegerOption(option =>
-                    option.setName('rate')
-                        .setDescription('規制時間 (ミリ秒) - 例: 1500 (1.5秒)')
-                        .setRequired(false)) 
-                .addStringOption(option =>
-                    option.setName('action')
-                        .setDescription('規制を超えた場合の動作 (rateと同時に指定)')
-                        .setRequired(false) 
-                        .addChoices(
-                            { name: 'メッセージを削除 (delete)', value: 'delete' },
-                            { name: 'ユーザーをタイムアウト (timeout)', value: 'timeout' }
-                        ))
-                .addIntegerOption(option =>
-                    option.setName('limit')
-                        .setDescription('メッセージの最大送信回数 - 例: 5')
-                        .setRequired(false))
-        )
-        .addSubcommand(subcommand =>
-            subcommand.setName('show')
-                .setDescription('現在の連投規制設定を表示します。')
-        );
+const rest = new REST({ version: '10' }).setToken(TOKEN);
 
-    // /purge コマンドの定義
-    const purgeCommand = new SlashCommandBuilder()
-        .setName('purge')
-        .setDescription('指定された数のメッセージを一括削除します（最大99件）。')
-        .setDefaultMemberPermissions(0) // デフォルトで管理者権限が必要
-        .addIntegerOption(option =>
-            option.setName('count')
-                .setDescription('削除するメッセージの数 (2～99)')
-                .setRequired(true)
-                .setMinValue(2)
-                .setMaxValue(99)
-        )
-        .addUserOption(option =>
-            option.setName('user')
-                .setDescription('指定したユーザーのメッセージのみ削除します。')
-                .setRequired(false)
-        );
-
+// スラッシュコマンドの登録
+async function registerCommands() {
     try {
-        await client.application.commands.set([
-            spamConfigCommand,
-            purgeCommand
-        ]);
-        console.log('スラッシュコマンドの登録が完了しました。');
-    } catch (e) {
-        console.error('ERROR: スラッシュコマンドの登録に失敗しました。', e);
+        console.log('Started refreshing application (/) commands.');
+        // グローバルコマンドとして登録
+        await rest.put(
+            Routes.applicationCommands(client.user.id),
+            { body: commands },
+        );
+        console.log('Successfully reloaded application (/) commands.');
+    } catch (error) {
+        console.error('Error registering commands:', error);
     }
-});
+}
 
-/**
- * データベースから設定を読み込むか、デフォルト設定を返します。
- * @param {string} guildId 
- * @returns {Promise<object>}
- */
+// --- Firestore Functions ---
+
+// スパム設定を取得
 async function getSpamSettings(guildId) {
-    try {
-        const docRef = collection(SETTINGS_COLLECTION).doc(guildId);
-        const docSnap = await docRef.get(); 
-
-        if (docSnap.exists) {
-            return docSnap.data();
-        } else {
-            // ドキュメントが存在しない場合はデフォルト設定を保存してから返す
-            await docRef.set(DEFAULT_SETTINGS); 
-            return DEFAULT_SETTINGS;
-        }
-    } catch (error) {
-        console.error("ERROR: Firestoreから設定の読み込み/保存に失敗しました。デフォルト設定を使用します。", error.message);
-        return DEFAULT_SETTINGS; 
-    }
+    const docRef = doc(db, SPAM_SETTINGS_PATH, guildId);
+    const docSnap = await getDoc(docRef);
+    return docSnap.exists() ? docSnap.data() : { threshold: 5, action: 'warn' };
 }
 
-/**
- * データベースに新しい設定を保存します。
- * @param {string} guildId 
- * @param {object} settings 
- */
-async function saveSpamSettings(guildId, settings) {
-    try {
-        const docRef = collection(SETTINGS_COLLECTION).doc(guildId);
-        await docRef.set(settings, { merge: true }); 
-    } catch (error) {
-        console.error("ERROR: Firestoreへの設定の保存に失敗しました。", error.message);
-    }
+// レートリミット設定を取得
+async function getRateLimitSettings(guildId) {
+    const docRef = doc(db, RATE_LIMIT_PATH, guildId);
+    const docSnap = await getDoc(docRef);
+    // デフォルト: 最小間隔なし、アクションは警告
+    return docSnap.exists() ? docSnap.data() : { milliseconds: 0, action: 'warn' }; 
 }
 
-// ユーザーごとのメッセージ履歴を保存するマップ
-const userMessageHistory = new Map();
+// スパム設定を保存
+async function saveSpamSettings(guildId, threshold, action) {
+    const docRef = doc(db, SPAM_SETTINGS_PATH, guildId);
+    await setDoc(docRef, { threshold, action, updatedBy: userId, updatedAt: new Date() });
+}
 
-client.on('messageCreate', async message => {
-    try {
-        if (message.author.bot || !message.guild) return;
+// レートリミット設定を保存
+async function saveRateLimitSettings(guildId, milliseconds, action) {
+    const docRef = doc(db, RATE_LIMIT_PATH, guildId);
+    await setDoc(docRef, { milliseconds, action, updatedBy: userId, updatedAt: new Date() });
+}
 
-        if (!message.member) {
-            try {
-                message.member = await message.guild.members.fetch(message.author.id);
-            } catch (e) {
-                console.error("Failed to fetch guild member (Check SERVER MEMBERS INTENT):", e);
-                return;
-            }
-        }
+// --- Spam Detection Logic (Simplistic Example) ---
+// Note: This is a placeholder for actual spam/scam detection.
+function isSpam(content) {
+    // 非常に単純なスパム判定: リンクが含まれており、かつ大文字が多い場合
+    const hasLink = content.includes('http') || content.includes('www.');
+    const upperCaseRatio = (content.match(/[A-Z]/g) || []).length / content.length;
+    return hasLink && upperCaseRatio > 0.5;
+}
 
-        const guildId = message.guild.id;
-        const userId = message.author.id;
-        const currentTimestamp = Date.now();
+// ユーザーメッセージ履歴（ローカルメモリ）
+const userMessageHistory = new Map(); // Map<guildId, Map<userId, messageContent[]>>
 
-        const settings = await getSpamSettings(guildId);
-        const { timeframe, limit, action } = settings;
+// --- Event Handlers ---
 
-        let history = userMessageHistory.get(userId) || [];
-        history = history.filter(timestamp => currentTimestamp - timestamp < timeframe);
-        history.push(currentTimestamp);
-        userMessageHistory.set(userId, history);
-
-        if (history.length > limit) {
-            console.log(`連投を検出: ユーザー ${message.author.tag} が ${timeframe}ms に ${history.length} 回送信しました。`);
-
-            if (action === 'delete') {
-                const messagesToDelete = await message.channel.messages.fetch({ limit: history.length });
-                messagesToDelete.forEach(msg => {
-                    if (msg.author.id === userId) {
-                        msg.delete().catch(err => console.error("メッセージ削除エラー (権限不足等):", err));
-                    }
-                });
-                message.channel.send(`🚨 **連投検知:** ${message.author} のメッセージが ${timeframe}ms 以内に ${limit} 回を超えたため削除しました。`).then(m => setTimeout(() => m.delete(), 5000));
-            } else if (action === 'timeout') {
-                const timeoutDuration = 60000; // 60秒
-                if (message.member) {
-                    try {
-                        await message.member.timeout(timeoutDuration, '連投規制違反');
-                        message.channel.send(`🚨 **連投検知:** ${message.author} を連投規制違反のため ${timeoutDuration / 1000}秒間タイムアウトしました。`).then(m => setTimeout(() => m.delete(), 5000));
-                    } catch (err) {
-                        console.error("CRITICAL: タイムアウト処理エラー。Botがサーバーより権限が低い可能性があります。", err);
-                        message.channel.send(`🚨 **連投検知:** ${message.author} のタイムアウトに失敗しました。（Botの権限不足）代わりにメッセージを削除します。`).then(m => setTimeout(() => m.delete(), 5000));
-                    }
-                } else {
-                     console.error("Member object missing, cannot execute timeout action.");
-                }
-            }
-            userMessageHistory.set(userId, []);
-        }
-    } catch (e) {
-        console.error("FATAL: messageCreateイベントで予期せぬエラーが発生しました。Botは続行します。", e);
+client.once('ready', async () => {
+    // Botの起動時にスラッシュコマンドを登録
+    if (client.user) {
+        await registerCommands();
+        console.log(`Botが起動しました | ユーザー名: ${client.user.tag}`);
+    } else {
+        console.error("Bot user object is null on ready.");
     }
 });
 
 client.on('interactionCreate', async interaction => {
+    if (!interaction.isCommand()) return;
+
+    const { commandName, guildId, options, channel, member } = interaction;
+
+    // 管理者権限チェック (メッセージ管理権限を持っているか)
+    if (!member.permissions.has('ManageMessages')) {
+        return interaction.reply({ content: '❌ **権限エラー:** このコマンドを使用するには「メッセージの管理」権限が必要です。', ephemeral: true });
+    }
+
     try {
-        if (!interaction.isCommand()) return;
-        
-        const { commandName } = interaction;
-        
-        // 常に権限チェックを行う
-        if (!interaction.memberPermissions.has('Administrator')) {
-            // 権限エラー応答はEphemeralのままにしておく (セキュリティ上の理由)
-            return interaction.reply({ content: 'このコマンドを実行するには管理者権限が必要です。', ephemeral: true });
-        }
-        
-        // ★★★ [修正点1] deferReplyで公開応答を強制するロジック ★★★
-        let isEphemeral = false;
-        // /spam-config set は管理者向けの設定なのでEphemeralのままにする
-        if (commandName === 'spam-config' && interaction.options.getSubcommand(false) === 'set') {
-            isEphemeral = true;
-        }
+        await interaction.deferReply({ ephemeral: true });
 
-        await interaction.deferReply({
-            ephemeral: isEphemeral
-        }); 
-
-        // /spam-config コマンドの処理
-        if (commandName === 'spam-config') {
-            const subcommand = interaction.options.getSubcommand();
-            const guildId = interaction.guild.id;
-            let settings = await getSpamSettings(guildId);
-
-            if (subcommand === 'set') {
-                const rate = interaction.options.getInteger('rate');
-                const action = interaction.options.getString('action');
-                const limit = interaction.options.getInteger('limit');
-                
-                let replyContent = '設定が更新されました:';
-                let changed = false; 
-
-                // ... (spam-config set のロジックは省略 - 変更なし)
-                
-                if (rate === null && limit === null) {
-                    return interaction.editReply({ 
-                        content: '設定を変更するには、**`rate` (規制時間) または `limit` (回数) の少なくとも一方**を指定する必要があります。'
-                    });
-                }
-                
-                if (rate !== null) {
-                    if (rate < 100) {
-                        return interaction.editReply({ content: '規制時間 (ミリ秒) は最低100ms以上に設定してください。' });
-                    }
-                    
-                    settings.timeframe = rate;
-                    replyContent += `\n- **規制時間:** ${rate}ミリ秒 (${(rate / 1000).toFixed(2)}秒)`;
-                    changed = true;
-
-                    if (action !== null) {
-                        settings.action = action;
-                        replyContent += `\n- **規制動作:** ${action}`;
-                    } else {
-                        replyContent += `\n- **規制動作:** (変更なし: ${settings.action})`;
-                    }
-                } else if (action !== null) {
-                     replyContent += `\n- **警告:** \`action\` は \`rate\` と同時に指定してください。今回は \`rate\` が変更されないため、\`action\` の変更は適用されません。`;
-                }
-
-                if (limit !== null) {
-                    if (limit < 2) {
-                        return interaction.editReply({ content: '連投回数は最低2回以上に設定してください。' });
-                    }
-                    settings.limit = limit;
-                    replyContent += `\n- **連投回数:** ${limit}回`;
-                    changed = true;
-                }
-                
-                if (changed) {
-                    await saveSpamSettings(guildId, settings);
-                }
-
-                // setコマンドの結果はEphemeralのまま
-                await interaction.editReply({
-                    content: replyContent
-                });
-
-            } else if (subcommand === 'show') {
-                const displayTime = settings.timeframe < 1000
-                    ? `${settings.timeframe}ミリ秒`
-                    : `${(settings.timeframe / 1000).toFixed(1)}秒`;
-
-                // showコマンドの結果は全員に見える（deferReplyでephemeral: falseが適用されている）
-                await interaction.editReply({
-                    content: `## 🚨 現在の連投規制設定\n\n- **規制時間 (タイムフレーム):** ${displayTime}\n- **連投回数 (リミット):** ${settings.limit}回\n- **規制動作 (アクション):** ${settings.action}`,
-                    ephemeral: false // ★★★ [修正点2] 念のためここでも公開を保証 ★★★
-                });
+        // --- /set-spam-threshold ---
+        if (commandName === 'set-spam-threshold') {
+            const threshold = options.getInteger('value');
+            if (threshold < 1 || threshold > 10) {
+                return interaction.editReply('❌ **エラー:** しきい値は1から10の間に設定してください。');
             }
-        
-        // /purge コマンドの処理 
-        } else if (commandName === 'purge') {
-            const count = interaction.options.getInteger('count');
-            const userToPurge = interaction.options.getUser('user');
-            const targetUserId = userToPurge ? userToPurge.id : null;
+            const settings = await getSpamSettings(guildId);
+            await saveSpamSettings(guildId, threshold, settings.action);
+            interaction.editReply(`✅ **スパムしきい値**を **${threshold} / 10** に設定しました。`);
+        }
+
+        // --- /set-spam-action ---
+        else if (commandName === 'set-spam-action') {
+            const action = options.getString('action');
+            const settings = await getSpamSettings(guildId);
+            await saveSpamSettings(guildId, settings.threshold, action);
+            interaction.editReply(`✅ スパム検出時の**アクション**を **${action}** に設定しました。`);
+        }
+
+        // --- /set-rate-limit (新機能) ---
+        else if (commandName === 'set-rate-limit') {
+            const milliseconds = options.getInteger('milliseconds');
+            const action = options.getString('limit_action');
+
+            if (milliseconds < 100) {
+                return interaction.editReply('❌ **エラー:** ミリ秒は最低でも100ms（0.1秒）以上に設定してください。高速すぎるとBotが不安定になります。');
+            }
+
+            await saveRateLimitSettings(guildId, milliseconds, action);
+            interaction.editReply(`✅ **連投規制**の最小間隔を **${milliseconds} ミリ秒** に設定しました。アクション: **${action}**`);
+        }
+
+
+        // --- /show-spam-settings ---
+        else if (commandName === 'show-spam-settings') {
+            const spamSettings = await getSpamSettings(guildId);
+            const rateLimitSettings = await getRateLimitSettings(guildId);
+
+            let response = `**📝 現在のスパム対策設定**\n`;
+            response += `---------------------------------\n`;
+            response += `**① スパム判定のしきい値:** ${spamSettings.threshold} / 10\n`;
+            response += `   * (直近10メッセージ中、これ以上のスパム検出でアクション)\n`;
+            response += `**② スパム検出時のアクション:** **${spamSettings.action.toUpperCase()}**\n`;
+            response += `\n`;
+            response += `**⚡ 連投規制 (レートリミット)**\n`;
+            response += `---------------------------------\n`;
+            response += `**③ 最小投稿間隔:** **${rateLimitSettings.milliseconds} ミリ秒**\n`;
+            response += `   * (0に設定されている場合、連投規制は無効です)\n`;
+            response += `**④ 規制時のアクション:** **${rateLimitSettings.action.toUpperCase()}**\n`;
+
+            interaction.editReply(response);
+        }
+
+        // --- /message-delete ---
+        else if (commandName === 'message-delete') {
+            const count = options.getInteger('count');
+            const maxDelete = 1000;
+            const batchSize = 100;
             
-            if (count < 2 || count > 99) {
-                // エラー応答はEphemeralのまま
-                return interaction.editReply({ content: '削除できるメッセージ数は2件から99件の間です。', ephemeral: true });
+            if (count < 1 || count > maxDelete) {
+                return interaction.editReply(`❌ **エラー:** 削除できるメッセージの数は1から${maxDelete}までです。`);
             }
 
             try {
-                // 削除対象のメッセージを取得
-                const fetched = await interaction.channel.messages.fetch({ limit: count });
-                
-                let messagesToDelete = fetched;
+                let totalDeleted = 0;
+                let messagesRemaining = count;
+                let lastMessageId = interaction.id; // コマンドメッセージより前のメッセージから取得を開始
 
-                // ユーザーが指定された場合、そのユーザーのメッセージにフィルタリング
-                if (targetUserId) {
-                    messagesToDelete = fetched.filter(msg => msg.author.id === targetUserId);
+                while (messagesRemaining > 0) {
+                    const fetchLimit = Math.min(batchSize, messagesRemaining);
+                    
+                    // メッセージを取得（最大100件）
+                    const fetched = await channel.messages.fetch({ 
+                        limit: fetchLimit, 
+                        before: lastMessageId 
+                    });
+
+                    if (fetched.size === 0) break; // もうメッセージがない場合、ループを終了
+
+                    // 一括削除を実行
+                    // filterOutOlder: true を設定しているため、14日以上前のメッセージは自動で除外される
+                    const deleted = await channel.bulkDelete(fetched, true);
+                    
+                    totalDeleted += deleted.size;
+                    messagesRemaining -= fetched.size;
+                    lastMessageId = fetched.last().id;
+
+                    // 14日以上前のメッセージしか残っておらず削除件数が0の場合、無限ループを防ぐために終了
+                    // または、fetchしたメッセージのうち、一部しか削除されなかった場合（14日制限に達した可能性が高いため）終了
+                    if (fetched.size > 0 && deleted.size < fetched.size) {
+                        break;
+                    }
                 }
-
-                // 一括削除の実行 (14日以上前のメッセージは自動で無視される)
-                const deleted = await interaction.channel.bulkDelete(messagesToDelete, true);
                 
-                const deleteCount = deleted.size;
+                // 応答メッセージを送信
+                interaction.editReply(`✅ **成功:** 直近のメッセージ **${totalDeleted} 件** (最大${maxDelete}件まで) を削除しました。\n*注: Discordの制限により、削除対象は過去14日以内のメッセージに限られます。*`);
                 
-                // ログEmbedを作成
-                const logEmbed = new EmbedBuilder()
-                    .setColor(0xFF0000) // 赤色
-                    .setTitle('🗑️ メッセージ一括削除 (Purge) ログ')
-                    .setDescription(`**${interaction.channel.name}** チャンネルでメッセージが削除されました。`)
-                    .addFields(
-                        { name: '実行者', value: interaction.user.tag, inline: true },
-                        { name: '削除件数', value: `${deleteCount}件`, inline: true },
-                        { name: '対象ユーザー', value: targetUserId ? `<@${targetUserId}>` : '全員', inline: true },
-                        { name: '削除されたチャンネル', value: `<#${interaction.channel.id}>`, inline: true },
-                        { name: 'コマンド実行日時', value: new Date().toISOString(), inline: false }
-                    )
-                    .setTimestamp();
-                
-                
-                // 全員に見える公開応答にする
-                await interaction.editReply({ 
-                    content: `✅ 削除が完了しました。**${deleteCount}件**のメッセージを削除しました。`,
-                    embeds: [logEmbed],
-                    ephemeral: false // ★★★ [修正点3] ここでも公開を保証 ★★★
-                });
-
-                // 5秒後に確認メッセージを自動で削除 (Wick風の動作)
-                setTimeout(() => {
-                    // Bot自身が送った応答メッセージを削除
-                    interaction.deleteReply().catch(err => console.error("応答メッセージの削除に失敗しました。", err));
-                }, 5000);
-
             } catch (error) {
                 console.error('メッセージ削除エラー:', error);
                 // エラー応答はEphemeralのまま
-                await interaction.editReply({ content: 'メッセージの削除に失敗しました。（Botに「メッセージの管理」権限があるか確認してください）', ephemeral: true });
+                await interaction.editReply({ content: '❌ **エラー:** メッセージの削除に失敗しました。（Botに「メッセージの管理」権限があるか、API制限に達していないか確認してください）', ephemeral: true });
             }
         }
-    } catch (e) {
-         console.error("FATAL: interactionCreateイベントで予期せぬエラーが発生しました。Botは続行します。", e);
-         if (interaction.deferred || interaction.replied) {
-             // エラー応答はEphemeralのまま
-             interaction.editReply({ content: 'コマンド実行中に予期せぬエラーが発生しました。', ephemeral: true }).catch(() => {});
-         } else {
-             // エラー応答はEphemeralのまま
-             interaction.reply({ content: 'コマンド実行中に予期せぬエラーが発生しました。', ephemeral: true }).catch(() => {});
-         }
+
+    } catch (error) {
+        console.error('Interaction Error:', error);
+        if (!interaction.deferred || interaction.ephemeral) {
+             interaction.reply({ content: '❌ **エラー:** コマンドの実行中に問題が発生しました。権限とログを確認してください。', ephemeral: true }).catch(e => console.error("Error replying to interaction:", e));
+        } else {
+             interaction.editReply('❌ **エラー:** コマンドの実行中に問題が発生しました。権限とログを確認してください。').catch(e => console.error("Error editing interaction reply:", e));
+        }
     }
 });
 
-// ********************************************
-// ★★★ Render/Replit対応のための追記（Botがスリープするのを防ぐ） ★★★
-// ********************************************
-const server = http.createServer((req, res) => {
-    // 外部からのアクセスに対してHTTPステータス200を返し、Botが稼働中であることを通知します
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Bot is running\n');
+client.on('messageCreate', async message => {
+    if (message.author.bot || !message.guild) return;
+
+    const guildId = message.guild.id;
+    const userId = message.author.id;
+    const content = message.content;
+    const now = Date.now();
+    let actionExecuted = false; // アクションが実行されたかどうかを追跡
+
+    // 1. --- 連投規制 (レートリミット) チェック ---
+    const rateLimitSettings = await getRateLimitSettings(guildId);
+    const minInterval = rateLimitSettings.milliseconds;
+    const rateAction = rateLimitSettings.action;
+    
+    if (minInterval > 0) {
+        const lastTime = lastUserMessage.get(userId) || 0;
+        if (now - lastTime < minInterval) {
+            console.log(`Rate Limit triggered for ${message.author.tag}`);
+            
+            if (rateAction === 'delete') {
+                await message.delete().catch(e => console.error('Delete message error (Rate Limit):', e));
+                actionExecuted = true;
+            } else if (rateAction === 'warn') {
+                message.reply(`🚨 **警告:** ${minInterval}ms 未満の連続投稿を検出しました。間隔を空けてください。`).catch(e => console.error('Warn message error (Rate Limit):', e));
+                actionExecuted = true;
+            }
+            // 規制が発動した場合、メッセージ履歴の更新は行わない（スパムと見なすため）
+            // 処理を継続すると、スパム判定も同時に実行されてしまうため、ここで終了
+            lastUserMessage.set(userId, now); // タイムアウト後もすぐに次の投稿を防ぐため時刻を更新
+            return;
+        }
+        lastUserMessage.set(userId, now); // 規制が発動しなかった場合は時刻を更新
+    }
+
+    // 2. --- スパムしきい値チェック ---
+    const spamSettings = await getSpamSettings(guildId);
+    const threshold = spamSettings.threshold;
+    const spamAction = spamSettings.action;
+
+    if (!userMessageHistory.has(guildId)) {
+        userMessageHistory.set(guildId, new Map());
+    }
+    const guildHistory = userMessageHistory.get(guildId);
+    if (!guildHistory.has(userId)) {
+        guildHistory.set(userId, []);
+    }
+    const history = guildHistory.get(userId);
+
+    // 履歴にメッセージを追加 (最新10件を保持)
+    history.push(content);
+    if (history.length > 10) {
+        history.shift();
+    }
+    guildHistory.set(userId, history); // 履歴を更新
+
+    // スパムメッセージの数をカウント
+    let spamCount = history.filter(isSpam).length;
+
+    // しきい値を超えたかチェック
+    if (spamCount >= threshold && history.length >= 10 && !actionExecuted) {
+        console.log(`Spam Threshold triggered for ${message.author.tag}. Count: ${spamCount}`);
+        
+        // 過去10件のメッセージを取得して処理
+        const messages = await message.channel.messages.fetch({ limit: 10 });
+        const userMessages = messages.filter(m => m.author.id === userId);
+
+        if (spamAction === 'delete') {
+            await message.channel.bulkDelete(userMessages, true)
+                .then(() => console.log(`Deleted ${userMessages.size} messages from ${message.author.tag}`))
+                .catch(e => console.error('Bulk delete error (Spam Threshold):', e));
+
+            // 削除後、ユーザーの履歴をクリア
+            guildHistory.set(userId, []);
+        } else if (spamAction === 'warn') {
+            message.reply(`🚨 **警告:** 連続したスパム行為を検出しました (${spamCount}/10)。行為を停止してください。`)
+                .catch(e => console.error('Warn message error (Spam Threshold):', e));
+        }
+    }
 });
 
-// BotをDiscordにログインさせ、成功後にWebサーバーを起動
-client.login(token)
-    .then(() => {
-        const port = process.env.PORT || 3000;
-        server.listen(port, () => {
-            console.log(`Replit Web Server is listening on port ${port}`); 
-        });
-    })
-    .catch(error => {
-        console.error("Discord Login Error: Discord APIへの接続に失敗しました。", error);
-        process.exit(1); // ログイン失敗時はBotを終了し、Renderに再起動させます
-    });
-// ********************************************
+client.login(TOKEN).catch(err => {
+    console.error("Bot Login Error (Check DISCORD_TOKEN and Intents):", err);
+});
