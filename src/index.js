@@ -1,5 +1,5 @@
-/// Discord Bot Main Script (index.js)
-// Discord.js v14/v15 対応と Firebase Firestore (Persistence) を含む
+// Discord Bot Main Script (index.js)
+// 変更点: interactionCreateのtry/catchブロックを強化し、deferReplyを確実に行うように修正
 
 // --- Import Modules ---
 import { Client, GatewayIntentBits, Collection, REST, Routes, ChannelType, PermissionsBitField, EmbedBuilder } from 'discord.js';
@@ -207,34 +207,46 @@ async function registerCommands() {
 
 // --- Event Handlers ---
 
-// Botの起動イベント (clientReadyを使用)
-client.once('clientReady', async () => {
-    // Botの起動時にスラッシュコマンドを登録
-    if (client.user) {
-        await registerCommands();
-        console.log(`Botが起動しました | ユーザー名: ${client.user.tag}`);
-    } else {
-        console.error("Bot user object is null on ready.");
+// Botの起動イベント (v14/v15ではclientReady、旧バージョンではready)
+client.once('clientReady', handleReady);
+client.once('ready', handleReady); // フォールバックとして ready も残す
+
+async function handleReady() {
+    // 既に起動済みかチェック (readyとclientReady両方が発火するのを防ぐ)
+    if (client.isReady()) {
+        if (client.user) {
+            await registerCommands();
+            console.log(`✅ Botが起動しました | ユーザー名: ${client.user.tag}`);
+        } else {
+            console.error("❌ Bot user object is null on ready.");
+        }
+        // readyイベントが二重に発火しないように、handlerを削除する
+        client.off('ready', handleReady);
+        client.off('clientReady', handleReady);
     }
-});
+}
 
 client.on('interactionCreate', async interaction => {
     if (!interaction.isCommand() || !interaction.guildId) return;
 
     const { commandName, guildId, options, channel, member } = interaction;
-
-    // Discord.js v13+では、コマンド定義のdefault_member_permissionsで権限チェックを推奨していますが、
-    // ここでも念のため「メッセージの管理」権限をチェックします。
-    // `member`が利用できない可能性があるため、PermissionsBitFieldを使用
-    const memberPermissions = member?.permissions;
-    if (!memberPermissions || !memberPermissions.has(PermissionsBitField.Flags.ManageMessages)) {
-        return interaction.reply({ content: '❌ **権限エラー:** このコマンドを使用するには「メッセージの管理」権限が必要です。', ephemeral: true });
-    }
+    const isEphemeral = !['message-delete', 'show-spam-settings'].includes(commandName);
 
     try {
-        // deferReplyを先に実行。message-deleteとshow-spam-settingsは公開応答
-        const isEphemeral = !['message-delete', 'show-spam-settings'].includes(commandName);
+        // 1. **最優先:** Discordの3秒ルールを満たすために、即座に deferReply を実行する
+        // Firestoreアクセスや権限チェックの前に実行することで、タイムアウトを防ぐ
         await interaction.deferReply({ ephemeral: isEphemeral }); 
+        
+        // 2. 権限チェック (Botにメッセージ管理権限があるか)
+        if (!member?.permissions.has(PermissionsBitField.Flags.ManageMessages)) {
+            return interaction.editReply('❌ **権限エラー:** このコマンドを使用するには「メッセージの管理」権限が必要です。');
+        }
+        
+        // Bot自身の権限もチェック
+        if (!interaction.guild?.members.me?.permissions.has(PermissionsBitField.Flags.ManageMessages)) {
+            return interaction.editReply('❌ **Bot権限エラー:** 私（Bot）に「メッセージの管理」権限がありません。ロールの設定を確認してください。');
+        }
+
 
         // --- /set-spam-threshold ---
         if (commandName === 'set-spam-threshold') {
@@ -264,7 +276,6 @@ client.on('interactionCreate', async interaction => {
                 return interaction.editReply('❌ **エラー:** ミリ秒は0以上の値を設定してください。');
             }
             if (milliseconds < 300 && milliseconds !== 0) {
-                // 300ms (0.3秒) 以下は不安定になる可能性があるため警告
                 await interaction.editReply(`⚠️ **注意:** ${milliseconds} ミリ秒はBotが不安定になる可能性があります。`);
             }
             
@@ -300,23 +311,19 @@ client.on('interactionCreate', async interaction => {
             const userToPurge = options.getUser('user');
             
             if (count < 1 || count > 100) {
-                // DiscordのAPI制限により、一回のfetchで取得できるのは最大100件
                 return interaction.editReply({ content: `❌ **エラー:** 削除できるメッセージの数は1から100までです。`, ephemeral: true });
             }
 
             try {
-                // コマンドメッセージより前のメッセージを取得
                 let fetched = await channel.messages.fetch({ 
                     limit: count, 
                     before: interaction.id 
                 });
 
                 if (userToPurge) {
-                    // 特定ユーザーのメッセージのみにフィルタリング
                     fetched = fetched.filter(msg => msg.author.id === userToPurge.id);
                 }
 
-                // bulkDeleteで一括削除 (14日以上前のメッセージは無視される)
                 const deletedMessages = await channel.bulkDelete(fetched, true);
                 
                 const logEmbed = new EmbedBuilder()
@@ -347,19 +354,18 @@ client.on('interactionCreate', async interaction => {
         }
 
     } catch (error) {
-        console.error('Interaction Error:', error);
-        // エラーが発生した場合、deferReplyの状態に応じて応答
-        const content = '❌ **重大エラー:** コマンドの処理中に予期せぬ問題が発生しました。';
-        if (interaction.deferred) {
-             interaction.editReply(content).catch(e => console.error("Error editing interaction reply:", e));
+        console.error('Interaction Processing Error (After Defer):', error);
+        // deferReplyの後にエラーが発生した場合、editReplyでユーザーに通知する
+        if (interaction.deferred || interaction.replied) {
+             interaction.editReply('❌ **予期せぬエラー:** コマンドの処理中に問題が発生しました。ログを確認してください。').catch(e => console.error("Error editing interaction reply after failure:", e));
         } else {
-             interaction.reply({ content, ephemeral: true }).catch(e => console.error("Error replying to interaction:", e));
+             // 滅多に発生しないが、念のため
+             interaction.reply({ content: '❌ **予期せぬエラー:** コマンドの処理中に問題が発生しました。', ephemeral: true }).catch(e => console.error("Error replying to interaction after failure:", e));
         }
     }
 });
 
 client.on('messageCreate', async message => {
-    // Bot自身のメッセージ、DM、またはシステムメッセージは無視
     if (message.author.bot || !message.guild || message.system) return;
 
     const guildId = message.guild.id;
@@ -369,7 +375,6 @@ client.on('messageCreate', async message => {
     
     // Botにメッセージを削除する権限があるかチェック
     if (!message.guild.members.me.permissions.has(PermissionsBitField.Flags.ManageMessages)) {
-        // 権限がない場合は処理をスキップ
         return;
     }
 
@@ -381,22 +386,20 @@ client.on('messageCreate', async message => {
     if (minInterval > 0) {
         const lastTime = lastUserMessage.get(userId) || 0;
         if (now - lastTime < minInterval) {
-            console.log(`Rate Limit triggered for ${message.author.tag} in ${message.guild.name}`);
+            console.log(`[RATE_LIMIT] 🚨 ${message.author.tag} が ${minInterval}ms 未満で連続投稿しました。`);
             
-            // アクション実行
             if (rateAction === 'delete') {
                 await message.delete().catch(e => console.error('Delete message error (Rate Limit):', e));
             } else if (rateAction === 'warn') {
                 message.reply(`🚨 **警告:** ${minInterval}ms 未満の連続投稿を検出しました。間隔を空けてください。`)
-                      .then(reply => setTimeout(() => reply.delete().catch(e => e), 5000)) // 5秒後に警告を自動削除
+                      .then(reply => setTimeout(() => reply.delete().catch(e => e), 5000))
                       .catch(e => console.error('Warn message error (Rate Limit):', e));
             }
-            // 規制が発動した場合、時刻を更新して、これ以上のスパムチェックを中断
             lastUserMessage.set(userId, now);
             return;
         }
     }
-    lastUserMessage.set(userId, now); // 規制が発動しなかった場合は時刻を更新
+    lastUserMessage.set(userId, now);
 
     // 2. --- スパムしきい値チェック ---
     const spamSettings = await getSpamSettings(guildId);
@@ -412,42 +415,34 @@ client.on('messageCreate', async message => {
     }
     const history = guildHistory.get(userId);
 
-    // 履歴にメッセージの内容を追加 (最新10件を保持)
     history.push(content);
     if (history.length > 10) {
         history.shift();
     }
-    guildHistory.set(userId, history); // 履歴を更新
+    guildHistory.set(userId, history);
 
-    // スパムメッセージの数をカウント
     let spamCount = history.filter(isSpam).length;
 
-    // しきい値を超えたかチェック
     if (spamCount >= threshold && history.length >= 10) {
-        console.log(`Spam Threshold triggered for ${message.author.tag}. Count: ${spamCount}`);
+        console.log(`[SPAM_THRESHOLD] ❌ ${message.author.tag} のスパム検出が ${spamCount}/${threshold} に達しました。`);
         
         if (spamAction === 'delete') {
-            // 過去10件のメッセージを取得し、対象ユーザーのメッセージを一括削除
             const messagesToDelete = await message.channel.messages.fetch({ limit: 10 })
                 .then(msgs => msgs.filter(m => m.author.id === userId));
 
             if (messagesToDelete.size > 0) {
                 await message.channel.bulkDelete(messagesToDelete, true)
-                    .then(() => console.log(`Deleted ${messagesToDelete.size} messages from ${message.author.tag} due to spam threshold.`))
                     .catch(e => console.error('Bulk delete error (Spam Threshold):', e));
             }
-
-            // 削除後、ユーザーの履歴をクリア
             guildHistory.set(userId, []);
         } else if (spamAction === 'warn') {
             message.reply(`🚨 **警告:** 連続したスパム行為を検出しました (${spamCount}/10)。行為を停止してください。`)
-                  .then(reply => setTimeout(() => reply.delete().catch(e => e), 5000)) // 5秒後に警告を自動削除
+                  .then(reply => setTimeout(() => reply.delete().catch(e => e), 5000))
                   .catch(e => console.error('Warn message error (Spam Threshold):', e));
-            // 警告の場合、履歴はリセットしない
         }
     }
 });
 
 client.login(TOKEN).catch(err => {
-    console.error("Bot Login Error (Check DISCORD_TOKEN and Intents):", err);
+    console.error("❌ Bot Login Error (Check DISCORD_TOKEN and Intents):", err);
 });
