@@ -1,5 +1,5 @@
 // Discord.jsをCommonJS形式で読み込みます
-const { Client, GatewayIntentBits, SlashCommandBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 // Firebase Admin SDKのコアモジュール全体をインポートします
 const admin = require('firebase-admin');
 // ★★★ Render/Replit対応のために http モジュールをインポート ★★★
@@ -48,7 +48,6 @@ const client = new Client({
 // ********************************************
 // ★★★ [重要] 未処理の例外をキャッチしてクラッシュを防ぐロジックの追加 ★★★
 // ********************************************
-// プログラムのどこかで予期せぬエラーが発生しても、Bot全体が落ちるのを防ぎます
 process.on('unhandledRejection', error => {
     console.error('Unhandled promise rejection (予期せぬエラー):', error);
 });
@@ -91,7 +90,7 @@ client.once('ready', async () => {
                 .setDescription('現在の連投規制設定を表示します。')
         );
 
-    // ★★★ [追加] メッセージ削除（パージ）コマンドの定義 ★★★
+    // ★★★ [変更] /purge コマンドの定義 (ユーザー指定オプションを追加) ★★★
     const purgeCommand = new SlashCommandBuilder()
         .setName('purge')
         .setDescription('指定された数のメッセージを一括削除します（最大99件）。')
@@ -102,12 +101,17 @@ client.once('ready', async () => {
                 .setRequired(true)
                 .setMinValue(2)
                 .setMaxValue(99)
+        )
+        .addUserOption(option =>
+            option.setName('user')
+                .setDescription('指定したユーザーのメッセージのみ削除します。')
+                .setRequired(false)
         );
 
     try {
         await client.application.commands.set([
             spamConfigCommand,
-            purgeCommand // 新しいコマンドを登録リストに追加
+            purgeCommand
         ]);
         console.log('スラッシュコマンドの登録が完了しました。');
     } catch (e) {
@@ -241,7 +245,7 @@ client.on('interactionCreate', async interaction => {
                 let changed = false; 
 
                 // ... (spam-config set のロジックは省略 - 変更なし)
-
+                
                 if (rate === null && limit === null) {
                     return interaction.editReply({ 
                         content: '設定を変更するには、**`rate` (規制時間) または `limit` (回数) の少なくとも一方**を指定する必要があります。'
@@ -294,32 +298,60 @@ client.on('interactionCreate', async interaction => {
                 });
             }
         
-        // ★★★ [追加] /purge コマンドの処理 ★★★
+        // ★★★ [変更] /purge コマンドの処理 (ユーザー指定とログ出力) ★★★
         } else if (commandName === 'purge') {
             const count = interaction.options.getInteger('count');
+            const userToPurge = interaction.options.getUser('user');
+            const targetUserId = userToPurge ? userToPurge.id : null;
             
             if (count < 2 || count > 99) {
                 return interaction.editReply({ content: '削除できるメッセージ数は2件から99件の間です。', ephemeral: true });
             }
 
             try {
-                // メッセージを一括削除
+                // 削除対象のメッセージを取得
                 const fetched = await interaction.channel.messages.fetch({ limit: count });
-                const deleted = await interaction.channel.bulkDelete(fetched, true); // 14日以上前のメッセージは無視
+                
+                let messagesToDelete = fetched;
+
+                // ユーザーが指定された場合、そのユーザーのメッセージにフィルタリング
+                if (targetUserId) {
+                    messagesToDelete = fetched.filter(msg => msg.author.id === targetUserId);
+                }
+
+                // 一括削除の実行 (14日以上前のメッセージは自動で無視される)
+                const deleted = await interaction.channel.bulkDelete(messagesToDelete, true);
                 
                 const deleteCount = deleted.size;
-                const replyMessage = `${deleteCount}件のメッセージを削除しました。`;
                 
-                await interaction.editReply({ content: replyMessage });
+                // ★★★ ログEmbedを作成 ★★★
+                const logEmbed = new EmbedBuilder()
+                    .setColor(0xFF0000) // 赤色
+                    .setTitle('🗑️ メッセージ一括削除 (Purge) ログ')
+                    .setDescription(`**${interaction.channel.name}** チャンネルでメッセージが削除されました。`)
+                    .addFields(
+                        { name: '実行者', value: interaction.user.tag, inline: true },
+                        { name: '削除件数', value: `${deleteCount}件`, inline: true },
+                        { name: '対象ユーザー', value: targetUserId ? `<@${targetUserId}>` : '全員', inline: true },
+                        { name: '削除されたチャンネル', value: `<#${interaction.channel.id}>`, inline: true },
+                        { name: 'コマンド実行日時', value: new Date().toISOString(), inline: false }
+                    )
+                    .setTimestamp();
+                
+                
+                // ★★★ 管理者向け応答 ★★★
+                await interaction.editReply({ 
+                    content: `✅ 削除が完了しました。**${deleteCount}件**のメッセージを削除しました。`,
+                    embeds: [logEmbed] 
+                });
 
-                // 5秒後に確認メッセージを削除
+                // 5秒後にembedメッセージを自動で削除
                 setTimeout(() => {
                     interaction.deleteReply().catch(err => console.error("応答メッセージの削除に失敗しました。", err));
                 }, 5000);
 
             } catch (error) {
                 console.error('メッセージ削除エラー:', error);
-                // 権限不足などで削除に失敗した場合
                 await interaction.editReply({ content: 'メッセージの削除に失敗しました。（Botに「メッセージの管理」権限があるか確認してください）' });
             }
         }
