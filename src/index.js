@@ -1,5 +1,5 @@
 // Discord Bot Main Script (index.js)
-// 変更点: interactionCreateのtry/catchブロックを強化し、deferReplyを確実に行うように修正
+// 変更点: message-delete コマンドの実行ロジックをループ処理に変更し、最大1000件の削除に対応
 
 // --- Import Modules ---
 import { Client, GatewayIntentBits, Collection, REST, Routes, ChannelType, PermissionsBitField, EmbedBuilder } from 'discord.js';
@@ -174,7 +174,7 @@ const commands = [
             {
                 name: 'count',
                 type: 4, // Integer
-                description: '削除するメッセージの数 (1-100)。', // Discordの制限により100件が実質上限
+                description: '削除するメッセージの数 (1-1000)。', // Discord APIの仕様に合わせ、Bot側で1000件までの削除をループで処理
                 required: true,
             },
             {
@@ -234,7 +234,6 @@ client.on('interactionCreate', async interaction => {
 
     try {
         // 1. **最優先:** Discordの3秒ルールを満たすために、即座に deferReply を実行する
-        // Firestoreアクセスや権限チェックの前に実行することで、タイムアウトを防ぐ
         await interaction.deferReply({ ephemeral: isEphemeral }); 
         
         // 2. 権限チェック (Botにメッセージ管理権限があるか)
@@ -307,47 +306,86 @@ client.on('interactionCreate', async interaction => {
 
         // --- /message-delete (Purge) ---
         else if (commandName === 'message-delete') {
-            const count = options.getInteger('count');
+            let count = options.getInteger('count');
             const userToPurge = options.getUser('user');
             
-            if (count < 1 || count > 100) {
-                return interaction.editReply({ content: `❌ **エラー:** 削除できるメッセージの数は1から100までです。`, ephemeral: true });
+            // 最大1000件に制限
+            if (count < 1) {
+                return interaction.editReply({ content: `❌ **エラー:** 削除するメッセージの数は1件以上である必要があります。`, ephemeral: true });
+            }
+            if (count > 1000) {
+                count = 1000;
+                await interaction.followUp({ content: '⚠️ **警告:** 一度の削除上限は1000件です。削除件数を1000に制限しました。', ephemeral: true });
             }
 
+            let lastId = interaction.id;
+            let deletedTotal = 0;
+
+            // ループ処理でメッセージを100件ずつ削除
             try {
-                let fetched = await channel.messages.fetch({ 
-                    limit: count, 
-                    before: interaction.id 
-                });
+                // 指定された件数に達するまでループ
+                while (deletedTotal < count) {
+                    const fetchLimit = Math.min(count - deletedTotal, 100);
+                    
+                    if (fetchLimit === 0) break;
 
-                if (userToPurge) {
-                    fetched = fetched.filter(msg => msg.author.id === userToPurge.id);
+                    let fetched = await channel.messages.fetch({ 
+                        limit: fetchLimit, 
+                        before: lastId 
+                    });
+
+                    // 取得したメッセージがない場合（チャンネルの終端に達した）
+                    if (fetched.size === 0) break; 
+                    
+                    let targetMessages = fetched;
+
+                    if (userToPurge) {
+                        targetMessages = fetched.filter(msg => msg.author.id === userToPurge.id);
+                    }
+
+                    // 14日以内のメッセージをまとめて削除
+                    const deletedMessages = await channel.bulkDelete(targetMessages, true);
+                    
+                    deletedTotal += deletedMessages.size;
+                    
+                    // 次のフェッチ開始地点を更新（今回最後に取得したメッセージのID）
+                    lastId = fetched.last().id;
+
+                    // Discord APIのレートリミット対策として少し待機
+                    if (deletedMessages.size > 0 && deletedTotal < count) {
+                        await new Promise(resolve => setTimeout(resolve, 1000)); // 1秒待機
+                    }
+                    
+                    // 削除中にユーザーに進捗を通知 (optional)
+                    if (deletedTotal % 200 === 0 && deletedTotal > 0) {
+                         console.log(`[PURGE] ${channel.name}: ${deletedTotal}件削除済み...`);
+                    }
                 }
-
-                const deletedMessages = await channel.bulkDelete(fetched, true);
                 
+                // 完了メッセージの作成
                 const logEmbed = new EmbedBuilder()
                     .setColor(0xFF0000)
                     .setTitle('🗑️ メッセージ一括削除 (Purge) ログ')
                     .setDescription(`**${channel.name}** チャンネルでメッセージが削除されました。`)
                     .addFields(
                         { name: '実行者', value: interaction.user.tag, inline: true },
-                        { name: '削除件数', value: `${deletedMessages.size}件`, inline: true },
+                        { name: '削除件数', value: `**${deletedTotal}件**`, inline: true },
                         { name: '対象ユーザー', value: userToPurge ? `<@${userToPurge.id}>` : '全員', inline: true },
                         { name: 'チャンネル', value: `<#${channel.id}>`, inline: true }
                     )
+                    .setFooter({ text: 'Discordの制限により、14日以上前のメッセージは削除されません。' })
                     .setTimestamp();
                 
                 await interaction.editReply({ 
-                    content: `✅ **一括削除 (Purge) 完了:** 過去14日以内のメッセージ **${deletedMessages.size} 件**を削除しました。`,
+                    content: `✅ **一括削除 (Purge) 完了:** 過去14日以内のメッセージを合計 **${deletedTotal} 件**削除しました。`,
                     embeds: [logEmbed],
                     ephemeral: false 
                 });
 
             } catch (error) {
-                console.error('メッセージ削除エラー:', error);
+                console.error('メッセージ削除エラー (Purge Loop):', error);
                 await interaction.editReply({ 
-                    content: '❌ **エラー:** メッセージの削除に失敗しました。（Botに「メッセージの管理」権限と、適切なロールの階層があるか確認してください）', 
+                    content: '❌ **エラー:** メッセージの削除に失敗しました。（Bot権限、ロール階層、またはAPIレートリミットを確認してください）', 
                     ephemeral: true 
                 });
             }
